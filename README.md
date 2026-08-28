@@ -147,6 +147,34 @@ agy-gyro
 
 `agy-gyro` handles local proxy startup, dynamic port binding, environment variable setup (`GOOGLE_GEMINI_BASE_URL`), and signal forwarding seamlessly!
 
+## Limitations & Streaming Behavior
+
+### Mid-Stream SSE Error Recovery
+
+While `agy-gyro` automatically intercepts and retries errors occurring prior to response streaming as well as early in-stream errors (errors emitted in the initial SSE chunk), it cannot transparently retry errors that occur **mid-stream** after valid tokens have already been delivered to the client:
+
+- **Root Cause**: The Gemini API immediately returns `HTTP 200 OK` with `text/event-stream` to reduce time-to-first-byte (TTFB). If backend TPU capacity is preempted or a token quota is exhausted mid-generation, an error frame (e.g. `503 UNAVAILABLE` or `429 RESOURCE_EXHAUSTED`) or a connection drop may occur after several successful chunks.
+- **Stream Integrity**: Once chunks are forwarded to `agy`, the CLI parser immediately processes and renders those tokens. Because the upstream Gemini API does not support stream resumption tokens or offset replay, restarting the request from scratch after partial delivery would produce duplicated tokens or corrupt the JSON/SSE stream.
+
+### Chunk 1 Error Interception (How `agy-gyro` Protects Streams)
+
+In practice, the overwhelming majority of transient Gemini errors under heavy load occur during initial model scheduling and prompt evaluation—arriving in the **very first data chunk (Chunk 1)** despite the `HTTP 200 OK` status. `agy-gyro` specifically guards against this:
+
+1. **Stream Peeking**: When an SSE stream opens, `agy-gyro` holds back the downstream response and peeks at the first incoming chunk.
+2. **Zero-Byte Leakage on Error**: If Chunk 1 contains a Gemini error object (e.g. `{"error": {"code": 503, "status": "UNAVAILABLE"}}`), `agy-gyro` suppresses it entirely—no bytes or headers have reached `agy`.
+3. **Seamless Retry**: The proxy calculates exponential backoff with jitter and replays the buffered request.
+4. **Zero-Latency Passthrough**: If Chunk 1 contains valid model output, `agy-gyro` commits the response and seamlessly chains Chunk 1 with the remainder of the live stream.
+
+### Summary Matrix
+
+| Error Stage | Upstream Behavior | `agy-gyro` Handling |
+| :--- | :--- | :--- |
+| **HTTP Status Error** | Upstream returns HTTP `429`, `503`, `500`, `502`, `504` before streaming | **Retried**: Request replayed with exponential backoff & jitter |
+| **Chunk 1 In-Stream Error** | Upstream returns `HTTP 200 OK`, but 1st SSE chunk contains an error JSON | **Retried**: Suppresses error chunk, holds back client response, and replays request |
+| **Mid-Stream Error (Chunk $N > 1$)** | Upstream emits valid tokens in chunks $1 \dots N-1$, then fails on chunk $N$ | **Forwarded**: Emits error to client to prevent duplicate tokens or corrupted stream |
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+
