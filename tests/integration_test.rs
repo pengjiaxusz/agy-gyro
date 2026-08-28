@@ -415,9 +415,11 @@ fn test_cli_parse_env_vars() {
     use clap::Parser;
 
     // Set AGY_GYRO_ environment variables
-    std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
-    std::env::set_var("AGY_GYRO_HOST", "0.0.0.0");
-    std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
+    unsafe {
+        std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
+        std::env::set_var("AGY_GYRO_HOST", "0.0.0.0");
+        std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
+    }
 
     let cli = Cli::parse_from(["agy-gyro"]);
 
@@ -426,7 +428,9 @@ fn test_cli_parse_env_vars() {
     assert_eq!(cli.wrapper_args.agy_path, "/custom/agy");
 
     // Clean up env vars
-    std::env::remove_var("AGY_GYRO_MAX_RETRIES");
-    std::env::remove_var("AGY_GYRO_HOST");
-    std::env::remove_var("AGY_GYRO_AGY_PATH");
+    unsafe {
+        std::env::remove_var("AGY_GYRO_MAX_RETRIES");
+        std::env::remove_var("AGY_GYRO_HOST");
+        std::env::remove_var("AGY_GYRO_AGY_PATH");
+    }
 }

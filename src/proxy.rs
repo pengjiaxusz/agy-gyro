@@ -204,39 +204,39 @@ pub async fn proxy_handler(
                     Some(Ok(first_chunk)) => {
                         if let Some((in_stream_status, err_msg)) =
                             parse_in_stream_error(&first_chunk)
+                                .filter(|(status, _)| is_retriable_status(*status))
                         {
-                            if is_retriable_status(in_stream_status) {
-                                if attempt < max_retries {
-                                    let delay = calculate_backoff(
-                                        attempt,
-                                        initial_delay,
-                                        max_delay,
-                                        with_jitter,
-                                        None,
-                                    );
+                            if attempt < max_retries {
+                                let delay = calculate_backoff(
+                                    attempt,
+                                    initial_delay,
+                                    max_delay,
+                                    with_jitter,
+                                    None,
+                                );
 
-                                    warn!(
-                                        "Upstream returned in-stream retriable error {} ({}) for {} {}. Retrying in {:?} (attempt {}/{})...",
-                                        in_stream_status,
-                                        err_msg,
-                                        method,
-                                        target_url,
-                                        delay,
-                                        attempt + 1,
-                                        max_retries
-                                    );
+                                warn!(
+                                    "Upstream returned in-stream retriable error {} ({}) for {} {}. Retrying in {:?} (attempt {}/{})...",
+                                    in_stream_status,
+                                    err_msg,
+                                    method,
+                                    target_url,
+                                    delay,
+                                    attempt + 1,
+                                    max_retries
+                                );
 
-                                    tokio::time::sleep(delay).await;
-                                    attempt += 1;
-                                    continue;
-                                } else {
-                                    warn!(
-                                        "Max retries ({}) reached for in-stream error {}. Forwarding stream to client.",
-                                        max_retries, in_stream_status
-                                    );
-                                }
+                                tokio::time::sleep(delay).await;
+                                attempt += 1;
+                                continue;
+                            } else {
+                                warn!(
+                                    "Max retries ({}) reached for in-stream error {}. Forwarding stream to client.",
+                                    max_retries, in_stream_status
+                                );
                             }
                         }
+
 
                         // Stream is healthy or retries exhausted: chain first chunk with remainder
                         let full_stream = futures_util::stream::once(async move {

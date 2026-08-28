@@ -1,7 +1,7 @@
 [package]
 name = "agy-gyro"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Gemini API retry proxy with exponential backoff for Antigravity CLI"
 
 [dependencies]
