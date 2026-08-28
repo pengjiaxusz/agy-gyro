@@ -28,7 +28,7 @@ pub struct Config {
     pub upstream: String,
 
     /// Maximum retry attempts on retriable errors
-    #[arg(long, env = "MAX_RETRIES", default_value_t = 10)]
+    #[arg(long, env = "MAX_RETRIES", default_value_t = 15)]
     pub max_retries: u32,
 
     /// Initial retry backoff delay in milliseconds

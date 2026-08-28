@@ -41,6 +41,56 @@ pub fn parse_retry_after(header_value: &str) -> Option<Duration> {
     None
 }
 
+/// Extracts error code and message from in-stream JSON or SSE event chunks.
+pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let trimmed = text.trim();
+    let json_str = if let Some(stripped) = trimmed.strip_prefix("data:") {
+        stripped.trim()
+    } else {
+        trimmed
+    };
+
+    if json_str.is_empty() || (!json_str.starts_with('{') && !json_str.starts_with('[')) {
+        return None;
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let error_obj = if let Some(err) = parsed.get("error") {
+        err
+    } else if let Some(first) = parsed.as_array().and_then(|arr| arr.first()) {
+        first.get("error")?
+    } else {
+        return None;
+    };
+
+    let message = error_obj
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("Unknown in-stream error")
+        .to_string();
+
+    let code_num = if let Some(code) = error_obj.get("code").and_then(|c| c.as_u64()) {
+        code as u16
+    } else if let Some(status_str) = error_obj.get("status").and_then(|s| s.as_str()) {
+        match status_str {
+            "UNAVAILABLE" => 503,
+            "RESOURCE_EXHAUSTED" => 429,
+            "INTERNAL" => 500,
+            "DEADLINE_EXCEEDED" => 504,
+            "BAD_GATEWAY" => 502,
+            "INVALID_ARGUMENT" => 400,
+            "PERMISSION_DENIED" => 403,
+            "NOT_FOUND" => 404,
+            _ => 500,
+        }
+    } else {
+        500
+    };
+
+    StatusCode::from_u16(code_num).ok().map(|sc| (sc, message))
+}
+
 /// Calculates exponential backoff with optional full jitter and Retry-After override.
 pub fn calculate_backoff(
     attempt: u32,
@@ -144,5 +194,21 @@ mod tests {
             assert!(delay >= Duration::from_millis(900));
             assert!(delay <= Duration::from_millis(3100));
         }
+    }
+
+    #[test]
+    fn test_parse_in_stream_error() {
+        let sse_503 = b"data: {\"error\": {\"code\": 503, \"message\": \"This model is currently experiencing high demand.\", \"status\": \"UNAVAILABLE\"}}\n\n";
+        let (status, msg) = parse_in_stream_error(sse_503).unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("high demand"));
+
+        let json_429 = b"{\"error\": {\"code\": 429, \"message\": \"Rate limit exceeded\", \"status\": \"RESOURCE_EXHAUSTED\"}}";
+        let (status, msg) = parse_in_stream_error(json_429).unwrap();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(msg, "Rate limit exceeded");
+
+        let normal_sse = b"data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"hello\"}]}}]}\n\n";
+        assert_eq!(parse_in_stream_error(normal_sse), None);
     }
 }

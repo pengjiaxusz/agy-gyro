@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::Config;
-use crate::retry::{calculate_backoff, is_retriable_error, is_retriable_status, parse_retry_after};
+use crate::retry::{
+    calculate_backoff, is_retriable_error, is_retriable_status, parse_in_stream_error,
+    parse_retry_after,
+};
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, OriginalUri, State},
@@ -10,6 +13,7 @@ use axum::{
     routing::any,
     Router,
 };
+use futures_util::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -40,6 +44,7 @@ fn is_hop_by_hop(header_name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "content-length"
+            | "content-encoding"
     )
 }
 
@@ -149,7 +154,7 @@ pub async fn proxy_handler(
                     );
                 }
 
-                // Build client response
+                // Build client response builder
                 let mut client_res_builder = Response::builder().status(status.as_u16());
 
                 for (name, val) in upstream_res.headers() {
@@ -161,20 +166,109 @@ pub async fn proxy_handler(
                     }
                 }
 
-                let stream = upstream_res.bytes_stream();
-                let body = Body::from_stream(stream);
+                let mut stream = upstream_res.bytes_stream();
 
-                return match client_res_builder.body(body) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        error!("Failed to build proxy response: {}", err);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to build proxy response: {}", err),
-                        )
-                            .into_response()
+                // Peek at the initial stream chunk to catch in-stream 503 / 429 errors early
+                match stream.next().await {
+                    Some(Ok(first_chunk)) => {
+                        if let Some((in_stream_status, err_msg)) =
+                            parse_in_stream_error(&first_chunk)
+                        {
+                            if is_retriable_status(in_stream_status) {
+                                if attempt < max_retries {
+                                    let delay = calculate_backoff(
+                                        attempt,
+                                        initial_delay,
+                                        max_delay,
+                                        with_jitter,
+                                        None,
+                                    );
+
+                                    warn!(
+                                        "Upstream returned in-stream retriable error {} ({}) for {} {}. Retrying in {:?} (attempt {}/{})...",
+                                        in_stream_status,
+                                        err_msg,
+                                        method,
+                                        target_url,
+                                        delay,
+                                        attempt + 1,
+                                        max_retries
+                                    );
+
+                                    tokio::time::sleep(delay).await;
+                                    attempt += 1;
+                                    continue;
+                                } else {
+                                    warn!(
+                                        "Max retries ({}) reached for in-stream error {}. Forwarding stream to client.",
+                                        max_retries, in_stream_status
+                                    );
+                                }
+                            }
+                        }
+
+                        // Stream is healthy or retries exhausted: chain first chunk with remainder
+                        let full_stream = futures_util::stream::once(async move {
+                            Ok::<_, reqwest::Error>(first_chunk)
+                        })
+                        .chain(stream);
+
+                        let body = Body::from_stream(full_stream);
+
+                        return match client_res_builder.body(body) {
+                            Ok(res) => res,
+                            Err(err) => {
+                                error!("Failed to build proxy response: {}", err);
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Failed to build proxy response: {}", err),
+                                )
+                                    .into_response()
+                            }
+                        };
                     }
-                };
+                    Some(Err(err)) => {
+                        if is_retriable_error(&err) && attempt < max_retries {
+                            let delay = calculate_backoff(
+                                attempt,
+                                initial_delay,
+                                max_delay,
+                                with_jitter,
+                                None,
+                            );
+
+                            warn!(
+                                "Upstream stream error on initial chunk for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                                method, target_url, err, delay, attempt + 1, max_retries
+                            );
+
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            error!(
+                                "Upstream error reading initial stream chunk for {} {}: {}",
+                                method, target_url, err
+                            );
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                format!("Bad Gateway: upstream stream read failed: {}", err),
+                            )
+                                .into_response();
+                        }
+                    }
+                    None => {
+                        // Empty response body
+                        return match client_res_builder.body(Body::empty()) {
+                            Ok(res) => res,
+                            Err(err) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build proxy response: {}", err),
+                            )
+                                .into_response(),
+                        };
+                    }
+                }
             }
             Err(err) => {
                 if is_retriable_error(&err) && attempt < max_retries {

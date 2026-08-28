@@ -298,3 +298,51 @@ async fn test_large_request_body_exceeding_default_limit() {
     let text = response.text().await.unwrap();
     assert_eq!(text, "Large body received OK");
 }
+
+#[tokio::test]
+async fn test_in_stream_503_error_retried_until_success() {
+    let mock_server = MockServer::start().await;
+
+    // First attempt returns 200 OK with an in-stream 503 error SSE payload
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"error\": {\"code\": 503, \"message\": \"This model is currently experiencing high demand.\", \"status\": \"UNAVAILABLE\"}}\n\n",
+                ),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Second attempt returns 200 OK with valid candidates SSE payload
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Streaming success!\"}]}}]}\n\n",
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 5).await;
+    let client = Client::new();
+
+    let response = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("Streaming success!"));
+}
