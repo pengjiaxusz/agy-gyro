@@ -12,6 +12,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "httpdate",
  "rand 0.8.8",
  "reqwest",
  "tokio",

@@ -16,6 +16,7 @@ http = "1.2"
 http-body-util = "0.1"
 bytes = "1.10"
 futures-util = "0.3"
+httpdate = "1.0"
 
 [dev-dependencies]
 tokio = { version = "1.43", features = ["full"] }
