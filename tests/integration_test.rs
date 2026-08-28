@@ -409,4 +409,24 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
     assert_eq!(exit_code, 42);
 }
 
+#[test]
+fn test_cli_parse_env_vars() {
+    use agy_gyro::config::Cli;
+    use clap::Parser;
 
+    // Set AGY_GYRO_ environment variables
+    std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
+    std::env::set_var("AGY_GYRO_HOST", "0.0.0.0");
+    std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
+
+    let cli = Cli::parse_from(["agy-gyro"]);
+
+    assert_eq!(cli.wrapper_args.config.max_retries, 42);
+    assert_eq!(cli.wrapper_args.config.host, "0.0.0.0");
+    assert_eq!(cli.wrapper_args.agy_path, "/custom/agy");
+
+    // Clean up env vars
+    std::env::remove_var("AGY_GYRO_MAX_RETRIES");
+    std::env::remove_var("AGY_GYRO_HOST");
+    std::env::remove_var("AGY_GYRO_AGY_PATH");
+}

@@ -110,16 +110,16 @@ agy-gyro server --port 8080
 
 | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-H`, `--host` | `HOST` | `127.0.0.1` | Host address to bind the proxy server |
-| `-p`, `--port` | `PORT` | `0` (wrapper) / `8080` (server) | Port to listen on (`0` = OS-assigned free port) |
-| `-u`, `--upstream` | `UPSTREAM_URL` | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL |
-| `--agy-path` | `AGY_PATH` | `agy` | Executable path for Antigravity CLI |
+| `-H`, `--host` | `AGY_GYRO_HOST` | `127.0.0.1` | Host address to bind the proxy server |
+| `-p`, `--port` | `AGY_GYRO_PORT` | `0` (wrapper) / `8080` (server) | Port to listen on (`0` = OS-assigned free port) |
+| `-u`, `--upstream` | `AGY_GYRO_UPSTREAM_URL` | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL |
+| `--agy-path` | `AGY_GYRO_AGY_PATH` | `agy` | Executable path for Antigravity CLI |
 | `--log-file` | `AGY_GYRO_LOG_FILE` | *None* | Path to log file for proxy tracing logs in wrapper mode |
-| `--max-retries` | `MAX_RETRIES` | `15` | Maximum number of retry attempts for retriable errors |
-| `--initial-delay-ms` | `INITIAL_DELAY_MS` | `1000` | Initial retry backoff delay in milliseconds |
-| `--max-delay-ms` | `MAX_DELAY_MS` | `60000` | Maximum backoff delay cap in milliseconds |
-| `--no-jitter` | `NO_JITTER` | `false` | Disable randomized jitter in backoff calculation |
-| `--request-timeout-secs` | `REQUEST_TIMEOUT_SECS` | `600` | Timeout per attempt in seconds |
+| `--max-retries` | `AGY_GYRO_MAX_RETRIES` | `15` | Maximum number of retry attempts for retriable errors |
+| `--initial-delay-ms` | `AGY_GYRO_INITIAL_DELAY_MS` | `1000` | Initial retry backoff delay in milliseconds |
+| `--max-delay-ms` | `AGY_GYRO_MAX_DELAY_MS` | `60000` | Maximum backoff delay cap in milliseconds |
+| `--no-jitter` | `AGY_GYRO_NO_JITTER` | `false` | Disable randomized jitter in backoff calculation |
+| `--request-timeout-secs` | `AGY_GYRO_REQUEST_TIMEOUT_SECS` | `600` | Timeout per attempt in seconds |
 
 ## Quick Start with Antigravity (`agy`)
 
