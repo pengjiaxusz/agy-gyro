@@ -21,3 +21,4 @@ httpdate = "1.0"
 [dev-dependencies]
 tokio = { version = "1.43", features = ["full"] }
 wiremock = "0.6"
+serde_json = "1.0"

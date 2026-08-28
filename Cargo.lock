@@ -15,6 +15,7 @@ dependencies = [
  "httpdate",
  "rand 0.8.8",
  "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
