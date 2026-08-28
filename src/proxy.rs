@@ -21,7 +21,32 @@ use tracing::{debug, error, info, warn};
 pub struct ProxyState {
     pub config: Config,
     pub client: reqwest::Client,
+    pub upstream_base: String,
 }
+
+impl ProxyState {
+    pub fn new(config: Config, client: reqwest::Client) -> Self {
+        let upstream_base = config.upstream.trim_end_matches('/').to_string();
+        Self {
+            config,
+            client,
+            upstream_base,
+        }
+    }
+}
+
+/// Builds a tuned reqwest HTTP client from the proxy configuration.
+pub fn build_http_client(config: &Config) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .pool_max_idle_per_host(32)
+        .tcp_keepalive(Duration::from_secs(60))
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .http2_keep_alive_while_idle(true)
+        .tcp_nodelay(true)
+        .build()
+}
+
 
 pub fn create_router(state: Arc<ProxyState>) -> Router {
     Router::new()
@@ -33,7 +58,7 @@ pub fn create_router(state: Arc<ProxyState>) -> Router {
 
 fn is_hop_by_hop(header_name: &HeaderName) -> bool {
     matches!(
-        header_name.as_str().to_lowercase().as_str(),
+        header_name.as_str(),
         "host"
             | "connection"
             | "keep-alive"
@@ -60,11 +85,18 @@ pub async fn proxy_handler(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let target_url = format!(
-        "{}{}",
-        state.config.upstream.trim_end_matches('/'),
-        path_and_query
-    );
+    let target_url_str = format!("{}{}", state.upstream_base, path_and_query);
+    let target_url = match reqwest::Url::parse(&target_url_str) {
+        Ok(url) => url,
+        Err(err) => {
+            error!("Failed to parse target URL {}: {}", target_url_str, err);
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid target URL: {}", err),
+            )
+                .into_response();
+        }
+    };
 
     let initial_delay = Duration::from_millis(state.config.initial_delay_ms);
     let max_delay = Duration::from_millis(state.config.max_delay_ms);
@@ -79,7 +111,7 @@ pub async fn proxy_handler(
             method, target_url, attempt, max_retries
         );
 
-        let mut req_builder = state.client.request(method.clone(), &target_url);
+        let mut req_builder = state.client.request(method.clone(), target_url.clone());
 
         // Forward headers
         for (header_name, header_val) in headers.iter() {
@@ -92,7 +124,7 @@ pub async fn proxy_handler(
         req_builder = req_builder.body(body.clone());
 
         match req_builder.send().await {
-            Ok(upstream_res) => {
+            Ok(mut upstream_res) => {
                 let status = upstream_res.status();
 
                 if is_retriable_status(status) {
@@ -111,12 +143,14 @@ pub async fn proxy_handler(
                             retry_after_duration,
                         );
 
-                        let error_body = upstream_res.text().await.unwrap_or_default();
-                        let snippet = if error_body.len() > 200 {
-                            format!("{}...", &error_body[..200])
-                        } else {
-                            error_body
-                        };
+                        let mut snippet = String::new();
+                        if let Ok(Some(chunk)) = upstream_res.chunk().await {
+                            let bytes = &chunk[..chunk.len().min(200)];
+                            snippet = String::from_utf8_lossy(bytes).trim().to_string();
+                            if chunk.len() > 200 {
+                                snippet.push_str("...");
+                            }
+                        }
 
                         warn!(
                             "Upstream returned retriable status {} for {} {}. Retrying in {:?} (attempt {}/{}). Response: {}",
@@ -126,7 +160,7 @@ pub async fn proxy_handler(
                             delay,
                             attempt + 1,
                             max_retries,
-                            snippet.trim()
+                            snippet
                         );
 
                         tokio::time::sleep(delay).await;
@@ -158,11 +192,8 @@ pub async fn proxy_handler(
                 let mut client_res_builder = Response::builder().status(status.as_u16());
 
                 for (name, val) in upstream_res.headers() {
-                    let h_name = HeaderName::from_bytes(name.as_str().as_bytes());
-                    if let Ok(valid_name) = h_name {
-                        if !is_hop_by_hop(&valid_name) {
-                            client_res_builder = client_res_builder.header(valid_name, val);
-                        }
+                    if !is_hop_by_hop(name) {
+                        client_res_builder = client_res_builder.header(name, val);
                     }
                 }
 
@@ -303,3 +334,4 @@ pub async fn proxy_handler(
         }
     }
 }
+

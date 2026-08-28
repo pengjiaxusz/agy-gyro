@@ -41,6 +41,31 @@ pub fn parse_retry_after(header_value: &str) -> Option<Duration> {
     None
 }
 
+use serde::Deserialize;
+use std::borrow::Cow;
+
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "'de: 'a"))]
+struct GeminiErrorDetails<'a> {
+    code: Option<u64>,
+    message: Option<Cow<'a, str>>,
+    status: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "'de: 'a"))]
+struct GeminiErrorWrapper<'a> {
+    error: GeminiErrorDetails<'a>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged, bound(deserialize = "'de: 'a"))]
+enum GeminiStreamError<'a> {
+    Single(GeminiErrorWrapper<'a>),
+    Array(Vec<GeminiErrorWrapper<'a>>),
+}
+
+
 /// Extracts error code and message from in-stream JSON or SSE event chunks.
 pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
     let text = std::str::from_utf8(bytes).ok()?;
@@ -55,24 +80,21 @@ pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
         return None;
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let error_obj = if let Some(err) = parsed.get("error") {
-        err
-    } else if let Some(first) = parsed.as_array().and_then(|arr| arr.first()) {
-        first.get("error")?
-    } else {
-        return None;
+    let parsed: GeminiStreamError = serde_json::from_str(json_str).ok()?;
+    let error_obj = match &parsed {
+        GeminiStreamError::Single(w) => &w.error,
+        GeminiStreamError::Array(arr) => &arr.first()?.error,
     };
 
     let message = error_obj
-        .get("message")
-        .and_then(|m| m.as_str())
+        .message
+        .as_deref()
         .unwrap_or("Unknown in-stream error")
         .to_string();
 
-    let code_num = if let Some(code) = error_obj.get("code").and_then(|c| c.as_u64()) {
+    let code_num = if let Some(code) = error_obj.code {
         code as u16
-    } else if let Some(status_str) = error_obj.get("status").and_then(|s| s.as_str()) {
+    } else if let Some(status_str) = error_obj.status.as_deref() {
         match status_str {
             "UNAVAILABLE" => 503,
             "RESOURCE_EXHAUSTED" => 429,
@@ -90,6 +112,7 @@ pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
 
     StatusCode::from_u16(code_num).ok().map(|sc| (sc, message))
 }
+
 
 /// Calculates exponential backoff with optional full jitter and Retry-After override.
 pub fn calculate_backoff(
