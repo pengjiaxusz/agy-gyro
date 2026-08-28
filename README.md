@@ -79,32 +79,53 @@ Or install it directly to your Cargo binary path:
 cargo install --path .
 ```
 
-## Configuration
+## Configuration & Modes
 
-`agy-gyro` can be customized via command-line flags or environment variables:
+`agy-gyro` operates in two modes: **Wrapper Mode** (default) and **Standalone Server Mode**.
+
+### Mode 1: Wrapper Mode (Default)
+
+Running `agy-gyro` without subcommands automatically starts an in-process proxy server on a dynamic TCP port (`127.0.0.1:0`), sets `GOOGLE_GEMINI_BASE_URL` automatically, and launches `agy`.
+
+```bash
+# Simply launch agy wrapped with agy-gyro proxy:
+agy-gyro
+
+# Pass arguments directly through to agy:
+agy-gyro -- --model gemini-2.5-pro
+
+# Optionally write proxy logs to a file:
+agy-gyro --log-file /tmp/gyro.log
+```
+
+### Mode 2: Standalone Server Mode (`agy-gyro server`)
+
+To run `agy-gyro` as a persistent background daemon or standalone server:
+
+```bash
+agy-gyro server --port 8080
+```
+
+### Options & Flags
 
 | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `-H`, `--host` | `HOST` | `127.0.0.1` | Host address to bind the proxy server |
-| `-p`, `--port` | `PORT` | `8080` | Port to listen on |
+| `-p`, `--port` | `PORT` | `0` (wrapper) / `8080` (server) | Port to listen on (`0` = OS-assigned free port) |
 | `-u`, `--upstream` | `UPSTREAM_URL` | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL |
+| `--agy-path` | `AGY_PATH` | `agy` | Executable path for Antigravity CLI |
+| `--log-file` | `AGY_GYRO_LOG_FILE` | *None* | Path to log file for proxy tracing logs in wrapper mode |
 | `--max-retries` | `MAX_RETRIES` | `15` | Maximum number of retry attempts for retriable errors |
 | `--initial-delay-ms` | `INITIAL_DELAY_MS` | `1000` | Initial retry backoff delay in milliseconds |
 | `--max-delay-ms` | `MAX_DELAY_MS` | `60000` | Maximum backoff delay cap in milliseconds |
 | `--no-jitter` | `NO_JITTER` | `false` | Disable randomized jitter in backoff calculation |
-| `--request-timeout-secs` | `REQUEST_TIMEOUT_SECS` | `600` | Timeout per attempt in seconds (useful for long reasoning chains) |
+| `--request-timeout-secs` | `REQUEST_TIMEOUT_SECS` | `600` | Timeout per attempt in seconds |
 
-## Usage with Antigravity (`agy`)
+## Quick Start with Antigravity (`agy`)
 
-### Step 1: Start `agy-gyro`
+### Step 1: Configure `agy` Settings
 
-```bash
-./target/release/agy-gyro
-```
-
-### Step 2: Configure `agy` Settings
-
-Ensure Antigravity is configured to use API key mode by editing your settings file:
+Ensure Antigravity is configured to use Gemini API key mode:
 - **macOS / Linux**: `~/.gemini/antigravity-cli/settings.json`
 - **Windows**: `%USERPROFILE%\.gemini\antigravity-cli\settings.json`
 
@@ -114,16 +135,17 @@ Ensure Antigravity is configured to use API key mode by editing your settings fi
 }
 ```
 
-### Step 3: Set Environment Variables & Launch `agy`
+### Step 2: Launch `agy` using `agy-gyro`
 
-Set your Gemini API key and point `GOOGLE_GEMINI_BASE_URL` to `agy-gyro`:
+Set your Gemini API key and run `agy-gyro`:
 
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"
-export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:8080"
 
-agy
+agy-gyro
 ```
+
+`agy-gyro` handles local proxy startup, dynamic port binding, environment variable setup (`GOOGLE_GEMINI_BASE_URL`), and signal forwarding seamlessly!
 
 ## License
 

@@ -13,7 +13,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
     let config = Config {
         host: "127.0.0.1".to_string(),
-        port: 0, // OS assigns random available port
+        port: Some(0), // OS assigns random available port
         upstream: upstream_url,
         max_retries,
         initial_delay_ms: 10, // fast retries in tests
@@ -27,10 +27,7 @@ async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
         .build()
         .unwrap();
 
-    let state = Arc::new(ProxyState {
-        config: config.clone(),
-        client,
-    });
+    let state = Arc::new(ProxyState::new(config, client));
 
     let app = create_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -346,3 +343,70 @@ async fn test_in_stream_503_error_retried_until_success() {
     let text = response.text().await.unwrap();
     assert!(text.contains("Streaming success!"));
 }
+
+#[test]
+fn test_cli_parse_server_command() {
+    use agy_gyro::config::{Cli, Commands};
+    use clap::Parser;
+
+    let cli = Cli::parse_from(["agy-gyro", "server", "-p", "9090"]);
+    assert!(matches!(cli.command, Some(Commands::Server(_))));
+    if let Some(Commands::Server(server_args)) = cli.command {
+        assert_eq!(server_args.resolved_port(), 9090);
+    }
+}
+
+#[test]
+fn test_cli_parse_wrapper_default_and_passthrough() {
+    use agy_gyro::config::Cli;
+    use clap::Parser;
+
+    let cli = Cli::parse_from([
+        "agy-gyro",
+        "--log-file",
+        "/tmp/test.log",
+        "--",
+        "--model",
+        "gemini-2.5-pro",
+    ]);
+
+    assert!(cli.command.is_none());
+    assert_eq!(
+        cli.wrapper_args.log_file.as_deref().unwrap().to_str().unwrap(),
+        "/tmp/test.log"
+    );
+    assert_eq!(
+        cli.wrapper_args.agy_args,
+        vec!["--model", "gemini-2.5-pro"]
+    );
+}
+
+#[tokio::test]
+async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
+    use agy_gyro::config::{Config, WrapperArgs};
+    use agy_gyro::runner::run_wrapper;
+
+    let wrapper_args = WrapperArgs {
+        config: Config {
+            host: "127.0.0.1".to_string(),
+            port: Some(0),
+            upstream: "https://generativelanguage.googleapis.com".to_string(),
+            max_retries: 3,
+            initial_delay_ms: 10,
+            max_delay_ms: 100,
+            no_jitter: true,
+            request_timeout_secs: 10,
+        },
+        agy_path: "sh".to_string(),
+        log_file: None,
+        agy_args: vec![
+            "-c".to_string(),
+            r#"test -n "$GOOGLE_GEMINI_BASE_URL" && exit 42"#.to_string(),
+        ],
+    };
+
+    let exit_code = run_wrapper(wrapper_args).await.unwrap();
+    assert_eq!(exit_code, 42);
+}
+
+

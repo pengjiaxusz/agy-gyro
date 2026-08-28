@@ -1,22 +1,76 @@
 // SPDX-License-Identifier: MIT
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "agy-gyro",
     author,
     version,
-    about = "Gemini API retry proxy with exponential backoff for Antigravity CLI (agy)"
+    about = "Gemini API retry proxy and wrapper for Antigravity CLI (agy)"
 )]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
+    #[command(flatten)]
+    pub wrapper_args: WrapperArgs,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Commands {
+    /// Run standalone proxy server in the foreground
+    Server(ServerArgs),
+    /// Run agy CLI wrapped with the local proxy (default mode)
+    Run(WrapperArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ServerArgs {
+    #[command(flatten)]
+    pub config: Config,
+}
+
+impl ServerArgs {
+    pub fn resolved_port(&self) -> u16 {
+        self.config.port.unwrap_or(8080)
+    }
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct WrapperArgs {
+    #[command(flatten)]
+    pub config: Config,
+
+    /// Executable path or command name for Antigravity CLI
+    #[arg(long, env = "AGY_PATH", default_value = "agy")]
+    pub agy_path: String,
+
+    /// Optional log file path for agy-gyro proxy tracing logs
+    #[arg(long, env = "AGY_GYRO_LOG_FILE")]
+    pub log_file: Option<PathBuf>,
+
+    /// Raw arguments passed through directly to agy
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub agy_args: Vec<String>,
+}
+
+impl WrapperArgs {
+    pub fn resolved_port(&self) -> u16 {
+        self.config.port.unwrap_or(0)
+    }
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct Config {
     /// Host address to bind the proxy server to
     #[arg(short = 'H', long, env = "HOST", default_value = "127.0.0.1")]
     pub host: String,
 
-    /// Port to listen on
-    #[arg(short = 'p', long, env = "PORT", default_value_t = 8080)]
-    pub port: u16,
+    /// Port to listen on (default: dynamic free port in wrapper mode, 8080 in server mode)
+    #[arg(short = 'p', long, env = "PORT")]
+    pub port: Option<u16>,
 
     /// Upstream Gemini API base URL
     #[arg(
@@ -53,3 +107,4 @@ impl Config {
         !self.no_jitter
     }
 }
+
