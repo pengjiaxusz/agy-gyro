@@ -266,3 +266,35 @@ async fn test_exhausted_max_retries_returns_upstream_error() {
     let text = response.text().await.unwrap();
     assert!(text.contains("RESOURCE_EXHAUSTED: Persistent quota error"));
 }
+
+#[tokio::test]
+async fn test_large_request_body_exceeding_default_limit() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-pro:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Large body received OK"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
+    let client = Client::new();
+
+    // Create a 5MB payload (which exceeds Axum's default 2MB limit)
+    let large_payload = vec![b'a'; 5 * 1024 * 1024];
+
+    let response = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:generateContent",
+            proxy_url
+        ))
+        .body(large_payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    assert_eq!(text, "Large body received OK");
+}

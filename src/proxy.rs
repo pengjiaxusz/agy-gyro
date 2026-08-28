@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::retry::{calculate_backoff, is_retriable_error, is_retriable_status, parse_retry_after};
 use axum::{
     body::{Body, Bytes},
-    extract::{OriginalUri, State},
+    extract::{DefaultBodyLimit, OriginalUri, State},
     http::{HeaderMap, HeaderName, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
@@ -23,6 +23,7 @@ pub fn create_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/", any(proxy_handler))
         .route("/{*path}", any(proxy_handler))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
