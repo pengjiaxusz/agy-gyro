@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
 
-use rand::Rng;
 use reqwest::StatusCode;
 use std::time::{Duration, SystemTime};
 
@@ -135,8 +134,7 @@ pub fn calculate_backoff(
     }
 
     // Apply jitter in range [0.5, 1.5]
-    let mut rng = rand::thread_rng();
-    let jitter_factor: f64 = rng.gen_range(0.5..=1.5);
+    let jitter_factor: f64 = rand::random_range(0.5..=1.5);
     let millis = (capped_delay.as_millis() as f64 * jitter_factor).round() as u64;
 
     Duration::from_millis(millis).min(max_delay)
