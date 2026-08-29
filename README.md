@@ -4,7 +4,10 @@
 
 # agy-gyro
 
+> **Disclaimer**: `agy-gyro` is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Google or the Antigravity team.
+
 `agy-gyro` is a high-performance, lightweight local retry proxy written in Rust designed to stabilize the Antigravity CLI (`agy`) against transient Google Gemini API errors.
+
 
 Just like a mechanical gyroscope provides stabilization to keep systems balanced through turbulence, `agy-gyro` acts as a stabilizer for `agy`. Whenever `agy` hits transient API turbulence (such as rate limits or server errors), `agy-gyro` absorbs the shock and keeps the interactive session smoothly on course.
 
