@@ -2,17 +2,43 @@
 name = "agy-gyro"
 version = "0.1.0"
 edition = "2024"
-description = "Gemini API retry proxy with exponential backoff for Antigravity CLI"
+authors = ["John Wu <topjohnwu@gmail.com>"]
+description = "Local retry proxy to stabilize the Antigravity CLI (agy) against transient Google Gemini API errors"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/topjohnwu/agy-gyro"
+homepage = "https://github.com/topjohnwu/agy-gyro"
+keywords = ["gemini", "retry", "proxy", "antigravity", "llm"]
+categories = [
+    "command-line-utilities",
+    "development-tools",
+    "network-programming",
+]
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "assets/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
 axum = { version = "0.8", features = ["tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+    "json",
+    "http2",
+] }
 clap = { version = "4.5", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
-futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", default-features = false, features = [
+    "alloc",
+] }
 httpdate = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -22,7 +48,6 @@ libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"
-
 
 [profile.release]
 opt-level = 3
