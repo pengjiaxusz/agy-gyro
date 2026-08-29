@@ -78,6 +78,8 @@ Install `agy-gyro` using `cargo`:
 cargo install agy-gyro
 ```
 
+Prebuilt executables for Linux, macOS, and Windows are also available in the [latest GitHub release](https://github.com/topjohnwu/agy-gyro/releases/latest).
+
 ## Configuration & Modes
 
 `agy-gyro` operates in two modes: **Wrapper Mode** (default) and **Standalone Server Mode**.

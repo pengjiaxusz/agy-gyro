@@ -1,0 +1,105 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Build for Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Build agy-gyro
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install musl-tools
+          rustup update
+          rustup target add ${{ matrix.arch }}-unknown-linux-musl
+
+          cargo build --target ${{ matrix.arch }}-unknown-linux-musl --release
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "agy-gyro") | .version')
+          zip -j agy-gyro-v$VERSION-linux-${{ matrix.arch }}.zip \
+            target/${{ matrix.arch }}-unknown-linux-musl/release/agy-gyro
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: agy-gyro-*.zip
+          archive: false
+
+  windows:
+    name: Build for Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+          - arch: aarch64
+            runner: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Build agy-gyro
+        run: |
+          rustup update
+          cargo build --release
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "agy-gyro") | .version')
+          cd target/release
+          7z a ../../agy-gyro-v$VERSION-windows-${{ matrix.arch }}.zip \
+            agy-gyro.exe
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: agy-gyro-*.zip
+          archive: false
+
+  macos:
+    name: Build for macOS (Universal)
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Build agy-gyro
+        run: |
+          rustup update
+          rustup target add x86_64-apple-darwin
+          rustup target add aarch64-apple-darwin
+          cargo build --target aarch64-apple-darwin --release
+          cargo build --target x86_64-apple-darwin --release
+          lipo -create -output target/agy-gyro \
+            target/aarch64-apple-darwin/release/agy-gyro \
+            target/x86_64-apple-darwin/release/agy-gyro
+          codesign -s - target/agy-gyro
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "agy-gyro") | .version')
+          zip -j agy-gyro-v$VERSION-macos-universal.zip \
+            target/agy-gyro
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: agy-gyro-*.zip
+          archive: false
