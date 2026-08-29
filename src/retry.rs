@@ -64,7 +64,6 @@ enum GeminiStreamError<'a> {
     Array(Vec<GeminiErrorWrapper<'a>>),
 }
 
-
 /// Extracts error code and message from in-stream JSON or SSE event chunks.
 pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
     let text = std::str::from_utf8(bytes).ok()?;
@@ -111,7 +110,6 @@ pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
 
     StatusCode::from_u16(code_num).ok().map(|sc| (sc, message))
 }
-
 
 /// Calculates exponential backoff with optional full jitter and Retry-After override.
 pub fn calculate_backoff(
@@ -163,14 +161,8 @@ mod tests {
 
     #[test]
     fn test_parse_retry_after_seconds() {
-        assert_eq!(
-            parse_retry_after("12"),
-            Some(Duration::from_secs(12))
-        );
-        assert_eq!(
-            parse_retry_after(" 5 "),
-            Some(Duration::from_secs(5))
-        );
+        assert_eq!(parse_retry_after("12"), Some(Duration::from_secs(12)));
+        assert_eq!(parse_retry_after(" 5 "), Some(Duration::from_secs(5)));
         assert_eq!(parse_retry_after("invalid"), None);
     }
 
@@ -179,11 +171,26 @@ mod tests {
         let initial = Duration::from_millis(1000);
         let max = Duration::from_millis(10000);
 
-        assert_eq!(calculate_backoff(0, initial, max, false, None), Duration::from_millis(1000));
-        assert_eq!(calculate_backoff(1, initial, max, false, None), Duration::from_millis(2000));
-        assert_eq!(calculate_backoff(2, initial, max, false, None), Duration::from_millis(4000));
-        assert_eq!(calculate_backoff(3, initial, max, false, None), Duration::from_millis(8000));
-        assert_eq!(calculate_backoff(4, initial, max, false, None), Duration::from_millis(10000)); // capped at max
+        assert_eq!(
+            calculate_backoff(0, initial, max, false, None),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            calculate_backoff(1, initial, max, false, None),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(
+            calculate_backoff(2, initial, max, false, None),
+            Duration::from_millis(4000)
+        );
+        assert_eq!(
+            calculate_backoff(3, initial, max, false, None),
+            Duration::from_millis(8000)
+        );
+        assert_eq!(
+            calculate_backoff(4, initial, max, false, None),
+            Duration::from_millis(10000)
+        ); // capped at max
     }
 
     #[test]
@@ -229,7 +236,8 @@ mod tests {
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(msg, "Rate limit exceeded");
 
-        let normal_sse = b"data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"hello\"}]}}]}\n\n";
+        let normal_sse =
+            b"data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"hello\"}]}}]}\n\n";
         assert_eq!(parse_in_stream_error(normal_sse), None);
     }
 }

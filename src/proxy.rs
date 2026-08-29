@@ -6,12 +6,12 @@ use crate::retry::{
     parse_retry_after,
 };
 use axum::{
+    Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, OriginalUri, State},
     http::{HeaderMap, HeaderName, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
-    Router,
 };
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -46,7 +46,6 @@ pub fn build_http_client(config: &Config) -> reqwest::Result<reqwest::Client> {
         .tcp_nodelay(true)
         .build()
 }
-
 
 pub fn create_router(state: Arc<ProxyState>) -> Router {
     Router::new()
@@ -179,7 +178,10 @@ pub async fn proxy_handler(
                             method, target_url, attempt, status
                         );
                     } else {
-                        debug!("Request {} {} succeeded (status {})", method, target_url, status);
+                        debug!(
+                            "Request {} {} succeeded (status {})",
+                            method, target_url, status
+                        );
                     }
                 } else {
                     debug!(
@@ -237,7 +239,6 @@ pub async fn proxy_handler(
                             }
                         }
 
-
                         // Stream is healthy or retries exhausted: chain first chunk with remainder
                         let full_stream = futures_util::stream::once(async move {
                             Ok::<_, reqwest::Error>(first_chunk)
@@ -270,7 +271,12 @@ pub async fn proxy_handler(
 
                             warn!(
                                 "Upstream stream error on initial chunk for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
-                                method, target_url, err, delay, attempt + 1, max_retries
+                                method,
+                                target_url,
+                                err,
+                                delay,
+                                attempt + 1,
+                                max_retries
                             );
 
                             tokio::time::sleep(delay).await;
@@ -334,4 +340,3 @@ pub async fn proxy_handler(
         }
     }
 }
-

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 
 use agy_gyro::config::{Cli, Commands, ServerArgs};
-use agy_gyro::proxy::{create_router, ProxyState};
+use agy_gyro::proxy::{ProxyState, create_router};
 use agy_gyro::runner::run_wrapper;
 use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,8 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing subscriber with env filter
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,agy_gyro=debug"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agy_gyro=debug"));
 
     let _ = tracing_subscriber::registry()
         .with(env_filter)
@@ -71,7 +71,6 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -97,4 +96,3 @@ async fn shutdown_signal() {
 
     info!("Shutdown signal received, shutting down gracefully...");
 }
-

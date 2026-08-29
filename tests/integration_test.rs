@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use agy_gyro::config::Config;
-use agy_gyro::proxy::{create_router, ProxyState};
+use agy_gyro::proxy::{ProxyState, create_router};
 use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
@@ -241,7 +241,8 @@ async fn test_exhausted_max_retries_returns_upstream_error() {
     Mock::given(method("POST"))
         .and(path("/v1beta/models/gemini-2.5-pro:generateContent"))
         .respond_with(
-            ResponseTemplate::new(429).set_body_string("RESOURCE_EXHAUSTED: Persistent quota error"),
+            ResponseTemplate::new(429)
+                .set_body_string("RESOURCE_EXHAUSTED: Persistent quota error"),
         )
         .expect(3) // 1 initial + 2 retries = 3 attempts total
         .mount(&mock_server)
@@ -372,13 +373,15 @@ fn test_cli_parse_wrapper_default_and_passthrough() {
 
     assert!(cli.command.is_none());
     assert_eq!(
-        cli.wrapper_args.log_file.as_deref().unwrap().to_str().unwrap(),
+        cli.wrapper_args
+            .log_file
+            .as_deref()
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "/tmp/test.log"
     );
-    assert_eq!(
-        cli.wrapper_args.agy_args,
-        vec!["--model", "gemini-2.5-pro"]
-    );
+    assert_eq!(cli.wrapper_args.agy_args, vec!["--model", "gemini-2.5-pro"]);
 }
 
 #[tokio::test]

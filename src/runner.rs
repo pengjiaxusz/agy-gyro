@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::WrapperArgs;
-use crate::proxy::{build_http_client, create_router, ProxyState};
+use crate::proxy::{ProxyState, build_http_client, create_router};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initializes the tracing subscriber for wrapper mode.
 ///
@@ -14,8 +14,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// - If `log_file` is provided, logs are written exclusively to that file.
 /// - If `log_file` is `None`, logs are directed to `std::io::sink()` (completely silenced).
 pub fn init_wrapper_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,agy_gyro=debug"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agy_gyro=debug"));
 
     if let Some(path) = log_file {
         if let Some(parent) = path.parent() {
@@ -28,7 +28,11 @@ pub fn init_wrapper_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::
 
         let _ = tracing_subscriber::registry()
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(file).with_ansi(false))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(file)
+                    .with_ansi(false),
+            )
             .try_init();
     } else {
         let _ = tracing_subscriber::registry()
@@ -91,14 +95,16 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
             );
             let _ = shutdown_tx.send(());
             let _ = server_handle.await;
-            eprintln!("agy-gyro: failed to execute '{}': {}", wrapper_args.agy_path, err);
+            eprintln!(
+                "agy-gyro: failed to execute '{}': {}",
+                wrapper_args.agy_path, err
+            );
             return Ok(127);
         }
     };
 
     #[cfg(unix)]
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(unix)]
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
@@ -160,4 +166,3 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
 
     Ok(exit_code)
 }
-

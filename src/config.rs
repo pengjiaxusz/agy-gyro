@@ -102,10 +102,8 @@ pub struct Config {
     pub request_timeout_secs: u64,
 }
 
-
 impl Config {
     pub fn is_jitter_enabled(&self) -> bool {
         !self.no_jitter
     }
 }
-
