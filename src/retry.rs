@@ -18,7 +18,7 @@ pub fn is_retriable_status(status: StatusCode) -> bool {
 
 /// Checks if a reqwest error is a transient network/connection error.
 pub fn is_retriable_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+    !err.is_builder() && !err.is_redirect() && !err.is_status()
 }
 
 /// Parses the standard HTTP `Retry-After` header value (either integer seconds or HTTP-date).
@@ -64,20 +64,7 @@ enum GeminiStreamError<'a> {
     Array(Vec<GeminiErrorWrapper<'a>>),
 }
 
-/// Extracts error code and message from in-stream JSON or SSE event chunks.
-pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let trimmed = text.trim();
-    let json_str = if let Some(stripped) = trimmed.strip_prefix("data:") {
-        stripped.trim()
-    } else {
-        trimmed
-    };
-
-    if json_str.is_empty() || (!json_str.starts_with('{') && !json_str.starts_with('[')) {
-        return None;
-    }
-
+fn parse_json_error(json_str: &str) -> Option<(StatusCode, String)> {
     let parsed: GeminiStreamError = serde_json::from_str(json_str).ok()?;
     let error_obj = match &parsed {
         GeminiStreamError::Single(w) => &w.error,
@@ -109,6 +96,38 @@ pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
     };
 
     StatusCode::from_u16(code_num).ok().map(|sc| (sc, message))
+}
+
+/// Extracts error code and message from in-stream JSON or SSE event chunks.
+pub fn parse_in_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+
+    // First check line-by-line in case multiple SSE events or lines are packed in a single chunk
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(stripped) = trimmed.strip_prefix("data:") {
+            let json_str = stripped.trim();
+            if (json_str.starts_with('{') || json_str.starts_with('['))
+                && let Some(err) = parse_json_error(json_str)
+            {
+                return Some(err);
+            }
+        }
+    }
+
+    // Also check the entire trimmed chunk (for non-SSE or raw multi-line JSON)
+    let trimmed = text.trim();
+    let json_str = if let Some(stripped) = trimmed.strip_prefix("data:") {
+        stripped.trim()
+    } else {
+        trimmed
+    };
+
+    if json_str.starts_with('{') || json_str.starts_with('[') {
+        parse_json_error(json_str)
+    } else {
+        None
+    }
 }
 
 /// Calculates exponential backoff with optional full jitter and Retry-After override.

@@ -201,7 +201,127 @@ pub async fn proxy_handler(
 
                 let mut stream = upstream_res.bytes_stream();
 
-                // Peek at the initial stream chunk to catch in-stream 503 / 429 errors early
+                if state.config.is_buffer_enabled() {
+                    let mut buffered_chunks: Vec<Bytes> = Vec::new();
+                    let mut stream_error = None;
+                    let mut in_stream_err_details = None;
+                    let mut chunk_index = 0;
+
+                    while let Some(chunk_res) = stream.next().await {
+                        match chunk_res {
+                            Ok(chunk) => {
+                                if let Some((in_stream_status, err_msg)) =
+                                    parse_in_stream_error(&chunk)
+                                        .filter(|(status, _)| is_retriable_status(*status))
+                                {
+                                    in_stream_err_details =
+                                        Some((chunk_index, in_stream_status, err_msg));
+                                    buffered_chunks.push(chunk);
+                                    break;
+                                }
+                                buffered_chunks.push(chunk);
+                                chunk_index += 1;
+                            }
+                            Err(err) => {
+                                stream_error = Some((chunk_index, err));
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some((chunk_idx, in_stream_status, err_msg)) = in_stream_err_details {
+                        if attempt < max_retries {
+                            let delay = calculate_backoff(
+                                attempt,
+                                initial_delay,
+                                max_delay,
+                                with_jitter,
+                                None,
+                            );
+
+                            warn!(
+                                "Upstream returned in-stream retriable error {} ({}) at chunk #{} for {} {}. Retrying in {:?} (attempt {}/{})...",
+                                in_stream_status,
+                                err_msg,
+                                chunk_idx + 1,
+                                method,
+                                target_url,
+                                delay,
+                                attempt + 1,
+                                max_retries
+                            );
+
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            warn!(
+                                "Max retries ({}) reached for in-stream error {}. Forwarding buffered stream to client.",
+                                max_retries, in_stream_status
+                            );
+                        }
+                    } else if let Some((chunk_idx, err)) = stream_error {
+                        if is_retriable_error(&err) && attempt < max_retries {
+                            let delay = calculate_backoff(
+                                attempt,
+                                initial_delay,
+                                max_delay,
+                                with_jitter,
+                                None,
+                            );
+
+                            warn!(
+                                "Upstream stream error at chunk #{} for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                                chunk_idx + 1,
+                                method,
+                                target_url,
+                                err,
+                                delay,
+                                attempt + 1,
+                                max_retries
+                            );
+
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            error!(
+                                "Upstream error reading stream at chunk #{} for {} {}: {}",
+                                chunk_idx + 1,
+                                method,
+                                target_url,
+                                err
+                            );
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                format!("Bad Gateway: upstream stream read failed: {}", err),
+                            )
+                                .into_response();
+                        }
+                    }
+
+                    // All chunks buffered cleanly (or retries exhausted) - stream buffered chunks to client
+                    let body_stream = futures_util::stream::iter(
+                        buffered_chunks
+                            .into_iter()
+                            .map(Ok::<_, std::convert::Infallible>),
+                    );
+                    let body = Body::from_stream(body_stream);
+
+                    return match client_res_builder.body(body) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            error!("Failed to build proxy response: {}", err);
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build proxy response: {}", err),
+                            )
+                                .into_response()
+                        }
+                    };
+                }
+
+                // Passthrough mode (--no-buffer): Peek at the initial stream chunk to catch in-stream 503 / 429 errors early
                 match stream.next().await {
                     Some(Ok(first_chunk)) => {
                         if let Some((in_stream_status, err_msg)) =

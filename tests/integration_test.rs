@@ -11,6 +11,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Helper function to start a test proxy pointing to the given upstream URL
 async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
+    spawn_test_proxy_opts(upstream_url, max_retries, false).await
+}
+
+/// Helper function to start a test proxy with configurable buffering
+async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer: bool) -> String {
     let config = Config {
         host: "127.0.0.1".to_string(),
         port: Some(0), // OS assigns random available port
@@ -19,6 +24,7 @@ async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
         initial_delay_ms: 10, // fast retries in tests
         max_delay_ms: 100,
         no_jitter: true,
+        no_buffer,
         request_timeout_secs: 10,
     };
 
@@ -385,6 +391,199 @@ fn test_cli_parse_wrapper_default_and_passthrough() {
 }
 
 #[tokio::test]
+async fn test_buffered_mode_recovers_from_midstream_error() {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use futures_util::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let count_clone = call_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        post(move || {
+            let count = count_clone.clone();
+            async move {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // First attempt: Chunk 1 valid candidates, Chunk 2 in-stream 503 error
+                    let s = stream::iter(vec![
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().data("{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Thinking...\"}]}}]}")
+                        ),
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().data("{\"error\": {\"code\": 503, \"message\": \"Mid-stream overload\", \"status\": \"UNAVAILABLE\"}}")
+                        ),
+                    ]);
+                    Sse::new(s)
+                } else {
+                    // Second attempt: Clean valid chunks
+                    let s = stream::iter(vec![
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().data("{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Thinking completed. \"}]}}]}")
+                        ),
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().data("{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Here is the full answer!\"}]}}]}")
+                        ),
+                    ]);
+                    Sse::new(s)
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mock_upstream = format!("http://{}", addr);
+
+    // Default mode is buffered (no_buffer = false)
+    let proxy_url = spawn_test_proxy(mock_upstream, 5).await;
+    let client = Client::new();
+
+    let response = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    // Proxy must have retried after chunk 2 error, giving the complete recovered stream without error
+    assert!(!text.contains("Mid-stream overload"));
+    assert!(text.contains("Thinking completed."));
+    assert!(text.contains("Here is the full answer!"));
+    assert_eq!(call_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_buffered_mode_recovers_from_midstream_connection_drop() {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use futures_util::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let count_clone = call_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        post(move || {
+            let count = count_clone.clone();
+            async move {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // Send 1 chunk then simulate IO stream error / drop
+                    let s = stream::iter(vec![
+                        Ok(Event::default().data("{\"candidates\": [{\"partial\": true}]}")),
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "simulated stream disconnect",
+                        )),
+                    ]);
+                    Sse::new(s)
+                } else {
+                    let s = stream::iter(vec![Ok(
+                        Event::default().data("{\"candidates\": [{\"clean\": true}]}")
+                    )]);
+                    Sse::new(s)
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mock_upstream = format!("http://{}", addr);
+
+    let proxy_url = spawn_test_proxy(mock_upstream, 5).await;
+    let client = Client::new();
+
+    let response = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("clean"));
+    assert_eq!(call_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_no_buffer_mode_passes_through_midstream_error() {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use futures_util::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let count_clone = call_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        post(move || {
+            let count = count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                let s = stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(
+                        Event::default().data("{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Partial text...\"}]}}]}")
+                    ),
+                    Ok::<_, std::convert::Infallible>(
+                        Event::default().data("{\"error\": {\"code\": 503, \"message\": \"Mid-stream overload\", \"status\": \"UNAVAILABLE\"}}")
+                    ),
+                ]);
+                Sse::new(s)
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mock_upstream = format!("http://{}", addr);
+
+    // Start proxy with no_buffer = true
+    let proxy_url = spawn_test_proxy_opts(mock_upstream, 5, true).await;
+    let client = Client::new();
+
+    let response = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    // In passthrough mode, client receives the partial text followed by the mid-stream error without retry
+    assert!(text.contains("Partial text..."));
+    assert!(text.contains("Mid-stream overload"));
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
     use agy_gyro::config::{Config, WrapperArgs};
     use agy_gyro::runner::run_wrapper;
@@ -398,6 +597,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             initial_delay_ms: 10,
             max_delay_ms: 100,
             no_jitter: true,
+            no_buffer: false,
             request_timeout_secs: 10,
         },
         agy_path: "sh".to_string(),
@@ -422,6 +622,7 @@ fn test_cli_parse_env_vars() {
         std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
         std::env::set_var("AGY_GYRO_HOST", "0.0.0.0");
         std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
+        std::env::set_var("AGY_GYRO_NO_BUFFER", "true");
     }
 
     let cli = Cli::parse_from(["agy-gyro"]);
@@ -429,11 +630,14 @@ fn test_cli_parse_env_vars() {
     assert_eq!(cli.wrapper_args.config.max_retries, 42);
     assert_eq!(cli.wrapper_args.config.host, "0.0.0.0");
     assert_eq!(cli.wrapper_args.agy_path, "/custom/agy");
+    assert!(cli.wrapper_args.config.no_buffer);
+    assert!(!cli.wrapper_args.config.is_buffer_enabled());
 
     // Clean up env vars
     unsafe {
         std::env::remove_var("AGY_GYRO_MAX_RETRIES");
         std::env::remove_var("AGY_GYRO_HOST");
         std::env::remove_var("AGY_GYRO_AGY_PATH");
+        std::env::remove_var("AGY_GYRO_NO_BUFFER");
     }
 }

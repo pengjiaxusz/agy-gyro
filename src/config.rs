@@ -97,6 +97,10 @@ pub struct Config {
     #[arg(long, env = "AGY_GYRO_NO_JITTER", default_value_t = false)]
     pub no_jitter: bool,
 
+    /// Disable full stream chunk buffering (stream chunks immediately to client after first chunk)
+    #[arg(long, env = "AGY_GYRO_NO_BUFFER", default_value_t = false)]
+    pub no_buffer: bool,
+
     /// Client request timeout in seconds (for long thinking / generation requests)
     #[arg(long, env = "AGY_GYRO_REQUEST_TIMEOUT_SECS", default_value_t = 600)]
     pub request_timeout_secs: u64,
@@ -105,5 +109,9 @@ pub struct Config {
 impl Config {
     pub fn is_jitter_enabled(&self) -> bool {
         !self.no_jitter
+    }
+
+    pub fn is_buffer_enabled(&self) -> bool {
+        !self.no_buffer
     }
 }

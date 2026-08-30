@@ -64,11 +64,10 @@ By default, the Antigravity CLI (`agy`) does not implement automatic retry loops
 - **Randomized Jitter**: Applies a random scaling factor ($0.5\times$ to $1.5\times$) to prevent thundering herd contention across concurrent sessions.
 - **Upstream `Retry-After`**: Automatically respects HTTP `Retry-After` headers (seconds or HTTP date) returned by Gemini.
 
-### 5. In-Stream SSE Error Interception
+### 5. Full-Stream Caching & Error Interception
 
-- For streaming requests (`streamGenerateContent`), `agy-gyro` inspects the initial SSE chunk before committing response headers to `agy`.
-- If an in-stream error frame (e.g. `503 UNAVAILABLE` high-demand message) is detected inside an `HTTP 200 OK` stream, the proxy suppresses it and retries the request.
-- Once a valid generation chunk arrives, `agy-gyro` pipes the response stream directly to `agy` with zero additional latency.
+- **Full-Stream Buffering (Default)**: By default, `agy-gyro` buffers every stream chunk until completion to verify the entire stream is error-free before committing headers or data to `agy`. If an in-stream error or connection drop occurs at any point (chunk 1, chunk 2, or later), `agy-gyro` discards the buffered chunks and replays the request with backoff. Zero bytes are leaked to `agy`, providing 100% resilience against mid-stream failures.
+- **Passthrough Mode (`--no-buffer`)**: If immediate chunk streaming is desired for lowest time-to-first-token latency, passing `--no-buffer` peeks at the initial stream chunk (Chunk 1) and immediately pipes subsequent chunks directly to `agy`.
 
 ## Installation
 
@@ -120,6 +119,7 @@ agy-gyro server --port 8080
 | `--initial-delay-ms`     | `AGY_GYRO_INITIAL_DELAY_MS`     | `1000`                                      | Initial retry backoff delay in milliseconds             |
 | `--max-delay-ms`         | `AGY_GYRO_MAX_DELAY_MS`         | `60000`                                     | Maximum backoff delay cap in milliseconds               |
 | `--no-jitter`            | `AGY_GYRO_NO_JITTER`            | `false`                                     | Disable randomized jitter in backoff calculation        |
+| `--no-buffer`            | `AGY_GYRO_NO_BUFFER`            | `false`                                     | Disable full stream buffering (stream chunks immediately)|
 | `--request-timeout-secs` | `AGY_GYRO_REQUEST_TIMEOUT_SECS` | `600`                                       | Timeout per attempt in seconds                          |
 
 ## Quick Start with Antigravity (`agy`)
@@ -149,31 +149,29 @@ agy-gyro
 
 `agy-gyro` handles local proxy startup, dynamic port binding, environment variable setup (`GOOGLE_GEMINI_BASE_URL`), and signal forwarding seamlessly!
 
-## Limitations & Streaming Behavior
+## Streaming & Error Recovery Behavior
 
-### Mid-Stream SSE Error Recovery
+### Default Mode: Full Stream Buffering
 
-While `agy-gyro` automatically intercepts and retries errors occurring prior to response streaming as well as early in-stream errors (errors emitted in the initial SSE chunk), it cannot transparently retry errors that occur **mid-stream** after valid tokens have already been delivered to the client:
+In default mode, `agy-gyro` buffers all incoming stream chunks before delivering them to `agy`:
+1. **Full Verification**: Ensures every chunk in the response is error-free and that the upstream stream completes cleanly.
+2. **Zero-Byte Leakage**: If an error (e.g. `503 UNAVAILABLE`, `429 RESOURCE_EXHAUSTED`, or network disconnect) occurs at chunk 1 or mid-stream, `agy-gyro` discards the buffered chunks and replays the request from scratch.
+3. **Flawless Delivery**: `agy` only receives verified, complete streams without partial output or syntax errors.
 
-- **Root Cause**: The Gemini API immediately returns `HTTP 200 OK` with `text/event-stream` to reduce time-to-first-byte (TTFB). If backend TPU capacity is preempted or a token quota is exhausted mid-generation, an error frame (e.g. `503 UNAVAILABLE` or `429 RESOURCE_EXHAUSTED`) or a connection drop may occur after several successful chunks.
-- **Stream Integrity**: Once chunks are forwarded to `agy`, the CLI parser immediately processes and renders those tokens. Because the upstream Gemini API does not support stream resumption tokens or offset replay, restarting the request from scratch after partial delivery would produce duplicated tokens or corrupt the JSON/SSE stream.
+### Passthrough Mode (`--no-buffer`)
 
-### Chunk 1 Error Interception (How `agy-gyro` Protects Streams)
-
-In practice, the overwhelming majority of transient Gemini errors under heavy load occur during initial model scheduling and prompt evaluation—arriving in the **very first data chunk (Chunk 1)** despite the `HTTP 200 OK` status. `agy-gyro` specifically guards against this:
-
-1. **Stream Peeking**: When an SSE stream opens, `agy-gyro` holds back the downstream response and peeks at the first incoming chunk.
-2. **Zero-Byte Leakage on Error**: If Chunk 1 contains a Gemini error object (e.g. `{"error": {"code": 503, "status": "UNAVAILABLE"}}`), `agy-gyro` suppresses it entirely—no bytes or headers have reached `agy`.
-3. **Seamless Retry**: The proxy calculates exponential backoff with jitter and replays the buffered request.
-4. **Zero-Latency Passthrough**: If Chunk 1 contains valid model output, `agy-gyro` commits the response and seamlessly chains Chunk 1 with the remainder of the live stream.
+When running with `--no-buffer`, `agy-gyro` verifies Chunk 1 and immediately streams subsequent tokens to minimize time-to-first-token latency:
+- **Chunk 1 Error**: Retried seamlessly before sending headers to `agy`.
+- **Mid-Stream Error (Chunk $N > 1$)**: Forwarded downstream to prevent duplicated tokens.
 
 ### Summary Matrix
 
-| Error Stage                          | Upstream Behavior                                                            | `agy-gyro` Handling                                                                  |
+| Error Stage                          | Default Buffering Mode                                                       | Passthrough Mode (`--no-buffer`)                                                     |
 | :----------------------------------- | :--------------------------------------------------------------------------- | :----------------------------------------------------------------------------------- |
-| **HTTP Status Error**                | Upstream returns HTTP `429`, `503`, `500`, `502`, `504` before streaming     | **Retried**: Request replayed with exponential backoff & jitter                      |
-| **Chunk 1 In-Stream Error**          | Upstream returns `HTTP 200 OK`, but 1st SSE chunk contains an error JSON     | **Retried**: Suppresses error chunk, holds back client response, and replays request |
-| **Mid-Stream Error (Chunk $N > 1$)** | Upstream emits valid tokens in chunks $1 \dots N-1$, then fails on chunk $N$ | **Forwarded**: Emits error to client to prevent duplicate tokens or corrupted stream |
+| **HTTP Status Error**                | **Retried**: Replays request with exponential backoff & jitter               | **Retried**: Replays request with exponential backoff & jitter                       |
+| **Chunk 1 In-Stream Error**          | **Retried**: Suppresses error chunk & replays request cleanly                | **Retried**: Suppresses error chunk & replays request cleanly                        |
+| **Mid-Stream Error (Chunk $N > 1$)** | **Retried**: Discards partial chunks & replays request cleanly from scratch  | **Forwarded**: Emits error to client to avoid duplicating already-streamed tokens   |
+| **Mid-Stream Connection Drop**       | **Retried**: Discards partial chunks & replays request cleanly from scratch  | **Failed**: Stream ends prematurely with network disconnect                          |
 
 ## License
 
