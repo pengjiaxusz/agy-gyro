@@ -9,9 +9,9 @@
 `agy-gyro` is a high-performance, lightweight local retry proxy written in Rust designed to stabilize the Antigravity CLI (`agy`) against transient Google Gemini API errors.
 
 
-Just like a mechanical gyroscope provides stabilization to keep systems balanced through turbulence, `agy-gyro` acts as a stabilizer for `agy`. Whenever `agy` hits transient API turbulence (such as rate limits or server errors), `agy-gyro` absorbs the shock and keeps the interactive session smoothly on course.
-
 ## Motivation
+
+### 1. Transient API Errors & Lack of Retries
 
 When interacting with the Google Gemini API directly using an API key, requests occasionally fail due to transient infrastructure errors or capacity limits:
 
@@ -28,6 +28,12 @@ By default, the Antigravity CLI (`agy`) does not implement automatic retry loops
 </p>
 
 `agy-gyro` solves this by acting as a transparent local HTTP proxy between `agy` and the upstream Gemini API (`generativelanguage.googleapis.com`). It catches transient errors, retries the requests internally using exponential backoff with jitter (following the [Gemini API Troubleshooting Guide](https://ai.google.dev/gemini-api/docs/troubleshooting)), and only returns the final result to `agy` once resolved (or when retry attempts are exhausted).
+
+### 2. Access to Newer / Unlisted Gemini Models
+
+When configured in Gemini API key mode (`"modelProvider": "gemini"`), `agy` uses a static, built-in model registry to validate and present available models. When Google releases newer models or previews on the Gemini API (such as `gemini-3.8-flash`), users cannot select them in `agy` until a new CLI release is published.
+
+Because Gemini REST API schemas (including prompt structures, tool call definitions, and reasoning `thinkingConfig` parameters) are shared across model generations, requests differ primarily by the model identifier in the REST URL. `agy-gyro` enables instant access to new models via transparent model remapping (`--redirect-model`), redirecting outbound requests at the proxy layer without requiring changes to `agy`.
 
 ## Technical Design
 
@@ -69,6 +75,13 @@ By default, the Antigravity CLI (`agy`) does not implement automatic retry loops
 - **Full-Stream Buffering (Default)**: By default, `agy-gyro` buffers every stream chunk until completion to verify the entire stream is error-free before committing headers or data to `agy`. If an in-stream error or connection drop occurs at any point (chunk 1, chunk 2, or later), `agy-gyro` discards the buffered chunks and replays the request with backoff. Zero bytes are leaked to `agy`, providing 100% resilience against mid-stream failures.
 - **Passthrough Mode (`--no-buffer`)**: If immediate chunk streaming is desired for lowest time-to-first-token latency, passing `--no-buffer` peeks at the initial stream chunk (Chunk 1) and immediately pipes subsequent chunks directly to `agy`.
 
+### 6. Dynamic Model Redirection & Remapping
+
+- **URL-Level Remapping**: Rewrites model path segments matching `FROM:TO` rules (e.g. `/v1beta/models/gemini-3.7-flash:streamGenerateContent` -> `/v1beta/models/gemini-3.8-flash:streamGenerateContent`).
+- **Preserves Full Context**: Transparently preserves the request body, including tool call declarations, workspace context, and reasoning configurations (`thinkingConfig` / `thinkingBudget`).
+- **Multi-Rule Support**: Supports mapping multiple models simultaneously using repeated flags or comma-separated environment variables (e.g., remapping Flash and Pro independently).
+- **Zero Overhead on Unmatched Traffic**: Requests that do not match any redirect rule (or non-model management endpoints) pass through without modification.
+
 ## Installation
 
 Install `agy-gyro` using `cargo`:
@@ -93,6 +106,9 @@ agy-gyro
 
 # Pass arguments directly through to agy:
 agy-gyro -- --model gemini-3.7-flash
+
+# Redirect requests from one model to another (e.g. gemini-3.7-flash -> gemini-3.8-flash):
+agy-gyro --redirect-model gemini-3.7-flash:gemini-3.8-flash
 
 # Optionally write proxy logs to a file:
 agy-gyro --log-file /tmp/gyro.log
@@ -121,6 +137,7 @@ agy-gyro server --port 8080
 | `--no-jitter`            | `AGY_GYRO_NO_JITTER`            | `false`                                     | Disable randomized jitter in backoff calculation        |
 | `--no-buffer`            | `AGY_GYRO_NO_BUFFER`            | `false`                                     | Disable full stream buffering (stream chunks immediately)|
 | `--request-timeout-secs` | `AGY_GYRO_REQUEST_TIMEOUT_SECS` | `600`                                       | Timeout per attempt in seconds                          |
+| `--redirect-model`       | `AGY_GYRO_REDIRECT_MODEL`       | _None_                                      | Redirect model requests in `FROM:TO` format             |
 
 ## Quick Start with Antigravity (`agy`)
 
@@ -148,6 +165,20 @@ agy-gyro
 ```
 
 `agy-gyro` handles local proxy startup, dynamic port binding, environment variable setup (`GOOGLE_GEMINI_BASE_URL`), and signal forwarding seamlessly!
+
+### Step 3: Access Newer Gemini Models (Optional)
+
+To use newer or experimental Gemini models (such as `gemini-3.8-flash`) not yet selectable in `agy`'s static model selector:
+
+```bash
+# Redirect all requests for gemini-3.7-flash to gemini-3.8-flash:
+agy-gyro --redirect-model gemini-3.7-flash:gemini-3.8-flash
+
+# Multiple models can be redirected simultaneously:
+agy-gyro \
+  --redirect-model gemini-3.7-flash:gemini-3.8-flash \
+  --redirect-model gemini-3.5-flash:gemini-3.8-flash
+```
 
 ## Streaming & Error Recovery Behavior
 

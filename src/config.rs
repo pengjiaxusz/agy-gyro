@@ -104,6 +104,10 @@ pub struct Config {
     /// Client request timeout in seconds (for long thinking / generation requests)
     #[arg(long, env = "AGY_GYRO_REQUEST_TIMEOUT_SECS", default_value_t = 600)]
     pub request_timeout_secs: u64,
+
+    /// Redirect model requests in format "FROM:TO" (e.g. "gemini-3.7-flash:gemini-3.8-flash")
+    #[arg(long, env = "AGY_GYRO_REDIRECT_MODEL", value_delimiter = ',')]
+    pub redirect_model: Vec<String>,
 }
 
 impl Config {
@@ -113,5 +117,12 @@ impl Config {
 
     pub fn is_buffer_enabled(&self) -> bool {
         !self.no_buffer
+    }
+
+    pub fn model_redirects(&self) -> Vec<(&str, &str)> {
+        self.redirect_model
+            .iter()
+            .filter_map(|s| s.split_once(':'))
+            .collect()
     }
 }

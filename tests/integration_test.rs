@@ -16,6 +16,16 @@ async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
 
 /// Helper function to start a test proxy with configurable buffering
 async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer: bool) -> String {
+    spawn_test_proxy_full(upstream_url, max_retries, no_buffer, Vec::new()).await
+}
+
+/// Helper function to start a test proxy with full configuration options
+async fn spawn_test_proxy_full(
+    upstream_url: String,
+    max_retries: u32,
+    no_buffer: bool,
+    redirect_model: Vec<String>,
+) -> String {
     let config = Config {
         host: "127.0.0.1".to_string(),
         port: Some(0), // OS assigns random available port
@@ -26,6 +36,7 @@ async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer
         no_jitter: true,
         no_buffer,
         request_timeout_secs: 10,
+        redirect_model,
     };
 
     let client = Client::builder()
@@ -599,6 +610,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             no_jitter: true,
             no_buffer: false,
             request_timeout_secs: 10,
+            redirect_model: Vec::new(),
         },
         agy_path: "sh".to_string(),
         log_file: None,
@@ -613,6 +625,145 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
 }
 
 #[test]
+fn test_rewrite_model_path_unit() {
+    use agy_gyro::proxy::rewrite_model_path;
+
+    let redirects = vec![
+        ("gemini-3.7-flash", "gemini-3.8-flash"),
+        ("gemini-3.5-flash", "gemini-3.8-flash"),
+    ];
+
+    // Standard streaming generateContent - matched rule
+    assert_eq!(
+        rewrite_model_path(
+            "/v1beta/models/gemini-3.7-flash:streamGenerateContent?alt=sse",
+            &redirects
+        ),
+        "/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"
+    );
+
+    // Standard generateContent - second matched rule
+    assert_eq!(
+        rewrite_model_path(
+            "/v1beta/models/gemini-3.5-flash:generateContent",
+            &redirects
+        ),
+        "/v1beta/models/gemini-3.8-flash:generateContent"
+    );
+
+    // Model path with query param - matched rule
+    assert_eq!(
+        rewrite_model_path("/v1/models/gemini-3.7-flash?key=abc", &redirects),
+        "/v1/models/gemini-3.8-flash?key=abc"
+    );
+
+    // Exact model endpoint - matched rule
+    assert_eq!(
+        rewrite_model_path("/v1beta/models/gemini-3.7-flash", &redirects),
+        "/v1beta/models/gemini-3.8-flash"
+    );
+
+    // Unmatched model remains untouched
+    assert_eq!(
+        rewrite_model_path("/v1beta/models/gemini-2.5-pro:generateContent", &redirects),
+        "/v1beta/models/gemini-2.5-pro:generateContent"
+    );
+
+    // Non-model paths remain untouched
+    assert_eq!(
+        rewrite_model_path("/v1beta/models", &redirects),
+        "/v1beta/models"
+    );
+    assert_eq!(
+        rewrite_model_path("/v1internal:fetchAvailableModels", &redirects),
+        "/v1internal:fetchAvailableModels"
+    );
+
+    // Empty redirects list leaves everything untouched
+    assert_eq!(
+        rewrite_model_path("/v1beta/models/gemini-3.7-flash:streamGenerateContent", &[]),
+        "/v1beta/models/gemini-3.7-flash:streamGenerateContent"
+    );
+}
+
+#[tokio::test]
+async fn test_redirect_model_rewrites_matched_and_ignores_unmatched() {
+    let mock_server = MockServer::start().await;
+
+    // Matched model: gemini-3.7-flash -> gemini-3.8-flash
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-3.8-flash:streamGenerateContent"))
+        .and(query_param("alt", "sse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Response from 3.8-flash\"}]}}]}\n\n"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Unmatched model: gemini-2.5-pro remains untouched
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-pro:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "candidates": [{ "content": { "parts": [{ "text": "Response from 2.5-pro" }] } }]
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy_full(
+        mock_server.uri(),
+        3,
+        false,
+        vec!["gemini-3.7-flash:gemini-3.8-flash".to_string()],
+    )
+    .await;
+
+    let client = Client::new();
+
+    // 1. Request for gemini-3.7-flash (should be rewritten to gemini-3.8-flash)
+    let res1 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-3.7-flash:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"contents":[{"parts":[{"text":"Hello"}]}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res1.status(), 200);
+    let text1 = res1.text().await.unwrap();
+    assert!(text1.contains("Response from 3.8-flash"));
+
+    // 2. Request for gemini-2.5-pro (should stay gemini-2.5-pro)
+    let res2 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:generateContent",
+            proxy_url
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"contents":[{"parts":[{"text":"Hello"}]}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res2.status(), 200);
+    let body2: serde_json::Value = res2.json().await.unwrap();
+    assert_eq!(
+        body2["candidates"][0]["content"]["parts"][0]["text"],
+        "Response from 2.5-pro"
+    );
+}
+
+#[test]
 fn test_cli_parse_env_vars() {
     use agy_gyro::config::Cli;
     use clap::Parser;
@@ -623,6 +774,10 @@ fn test_cli_parse_env_vars() {
         std::env::set_var("AGY_GYRO_HOST", "0.0.0.0");
         std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
         std::env::set_var("AGY_GYRO_NO_BUFFER", "true");
+        std::env::set_var(
+            "AGY_GYRO_REDIRECT_MODEL",
+            "gemini-3.7-flash:gemini-3.8-flash,gemini-3.5-flash:gemini-3.8-flash",
+        );
     }
 
     let cli = Cli::parse_from(["agy-gyro"]);
@@ -632,6 +787,20 @@ fn test_cli_parse_env_vars() {
     assert_eq!(cli.wrapper_args.agy_path, "/custom/agy");
     assert!(cli.wrapper_args.config.no_buffer);
     assert!(!cli.wrapper_args.config.is_buffer_enabled());
+    assert_eq!(
+        cli.wrapper_args.config.redirect_model,
+        vec![
+            "gemini-3.7-flash:gemini-3.8-flash".to_string(),
+            "gemini-3.5-flash:gemini-3.8-flash".to_string()
+        ]
+    );
+    assert_eq!(
+        cli.wrapper_args.config.model_redirects(),
+        vec![
+            ("gemini-3.7-flash", "gemini-3.8-flash"),
+            ("gemini-3.5-flash", "gemini-3.8-flash")
+        ]
+    );
 
     // Clean up env vars
     unsafe {
@@ -639,5 +808,28 @@ fn test_cli_parse_env_vars() {
         std::env::remove_var("AGY_GYRO_HOST");
         std::env::remove_var("AGY_GYRO_AGY_PATH");
         std::env::remove_var("AGY_GYRO_NO_BUFFER");
+        std::env::remove_var("AGY_GYRO_REDIRECT_MODEL");
     }
+}
+
+#[test]
+fn test_cli_parse_redirect_model_flags() {
+    use agy_gyro::config::Cli;
+    use clap::Parser;
+
+    let cli = Cli::parse_from([
+        "agy-gyro",
+        "--redirect-model",
+        "gemini-3.7-flash:gemini-3.8-flash",
+        "--redirect-model",
+        "gemini-3.1-pro:gemini-3.1-pro-preview",
+    ]);
+
+    assert_eq!(
+        cli.wrapper_args.config.model_redirects(),
+        vec![
+            ("gemini-3.7-flash", "gemini-3.8-flash"),
+            ("gemini-3.1-pro", "gemini-3.1-pro-preview")
+        ]
+    );
 }

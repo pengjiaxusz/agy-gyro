@@ -72,6 +72,32 @@ fn is_hop_by_hop(header_name: &HeaderName) -> bool {
     )
 }
 
+/// Rewrites the model identifier in Gemini API paths if it matches any configured redirect rule.
+pub fn rewrite_model_path(path_and_query: &str, redirects: &[(&str, &str)]) -> String {
+    if redirects.is_empty() {
+        return path_and_query.to_string();
+    }
+
+    if let Some(models_idx) = path_and_query.find("/models/") {
+        let prefix_end = models_idx + "/models/".len();
+        let prefix = &path_and_query[..prefix_end];
+        let rest = &path_and_query[prefix_end..];
+
+        let model_end = rest.find([':', '/', '?']).unwrap_or(rest.len());
+
+        if model_end > 0 {
+            let model_name = &rest[..model_end];
+            for &(from, to) in redirects {
+                if model_name == from {
+                    let remainder = &rest[model_end..];
+                    return format!("{}{}{}", prefix, to, remainder);
+                }
+            }
+        }
+    }
+    path_and_query.to_string()
+}
+
 pub async fn proxy_handler(
     State(state): State<Arc<ProxyState>>,
     method: Method,
@@ -79,12 +105,26 @@ pub async fn proxy_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let path_and_query = original_uri
+    let raw_path_and_query = original_uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let target_url_str = format!("{}{}", state.upstream_base, path_and_query);
+    let redirects = state.config.model_redirects();
+    let effective_path = if !redirects.is_empty() {
+        let rewritten = rewrite_model_path(raw_path_and_query, &redirects);
+        if rewritten != raw_path_and_query {
+            debug!(
+                "Redirecting model in request path: {} -> {}",
+                raw_path_and_query, rewritten
+            );
+        }
+        rewritten
+    } else {
+        raw_path_and_query.to_string()
+    };
+
+    let target_url_str = format!("{}{}", state.upstream_base, effective_path);
     let target_url = match reqwest::Url::parse(&target_url_str) {
         Ok(url) => url,
         Err(err) => {
