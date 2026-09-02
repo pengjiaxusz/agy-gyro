@@ -29,14 +29,6 @@ By default, the Antigravity CLI (`agy`) does not implement automatic retry loops
 
 `agy-gyro` solves this by acting as a transparent local HTTP proxy between `agy` and the upstream Gemini API (`generativelanguage.googleapis.com`). It catches transient errors, retries the requests internally using exponential backoff with jitter (following the [Gemini API Troubleshooting Guide](https://ai.google.dev/gemini-api/docs/troubleshooting)), and only returns the final result to `agy` once resolved (or when retry attempts are exhausted).
 
-### 2. Access to Newer / Unlisted Gemini Models
-
-When configured in Gemini API key mode (`"modelProvider": "gemini"`), `agy` uses a static, built-in model registry to validate and present available models. When Google releases newer models or previews on the Gemini API (such as `gemini-3.8-flash`), users cannot select them in `agy` until a new CLI release is published.
-
-Because Gemini REST API schemas (including prompt structures, tool call definitions, and reasoning `thinkingConfig` parameters) are shared across model generations, requests differ primarily by the model identifier in the REST URL. `agy-gyro` enables instant access to new models via transparent model remapping (`--redirect-model`), redirecting outbound requests at the proxy layer without requiring changes to `agy`.
-
-## Technical Design
-
 ```
 +------------------+         +---------------------+         +-------------------------------------+
 | Antigravity CLI  |  HTTP   |      agy-gyro       |  HTTPS  |          Google Gemini API          |
@@ -49,38 +41,11 @@ Because Gemini REST API schemas (including prompt structures, tool call definiti
 +------------------+         +---------------------+         +-------------------------------------+
 ```
 
-### 1. Request Forwarding & Header Management
+### 2. Access to Newer / Unlisted Gemini Models
 
-- Preserves all HTTP methods, request paths (e.g. `/v1beta/models/...`), query parameters (`?alt=sse`), and authentication headers (`x-goog-api-key`, `Authorization`).
-- Strips hop-by-hop and transport headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `TE`, `Upgrade`, `Proxy-Authenticate`, `Proxy-Authorization`, `Trailers`, `Content-Length`, `Content-Encoding`, `Host`) to prevent upstream TLS and decompression conflicts.
+When configured in Gemini API key mode (`"modelProvider": "gemini"`), `agy` uses a static, built-in model registry to validate and present available models. When Google releases newer models or previews on the Gemini API (such as `gemini-3.8-flash`), users cannot select them in `agy` until a new CLI release is published.
 
-### 2. Large Request Payload Buffering
-
-- Disables Axum's default 2MB request body limit (`DefaultBodyLimit::disable()`).
-- Buffers full request payloads in memory so multi-file codebases, diffs, and images can be replayed across retries.
-
-### 3. Transient Error Classification
-
-- **Retriable Errors**: `429` (Quota/Rate Limit), `503` (Service Unavailable), `500` (Internal Error), `502` (Bad Gateway), `504` (Gateway Timeout), `408` (Request Timeout), and network connection drops.
-- **Fast-Fail Errors**: Client errors like `400` (Bad Request), `401` (Unauthorized), `403` (Forbidden), and `404` (Not Found) bypass retries and return immediately to `agy`.
-
-### 4. Exponential Backoff with Jitter
-
-- **Exponential Scaling**: Doubles the wait delay after each failed attempt up to a configurable cap (`--max-delay-ms`, default 60s).
-- **Randomized Jitter**: Applies a random scaling factor ($0.5\times$ to $1.5\times$) to prevent thundering herd contention across concurrent sessions.
-- **Upstream `Retry-After`**: Automatically respects HTTP `Retry-After` headers (seconds or HTTP date) returned by Gemini.
-
-### 5. Full-Stream Caching & Error Interception
-
-- **Full-Stream Buffering (Default)**: By default, `agy-gyro` buffers every stream chunk until completion to verify the entire stream is error-free before committing headers or data to `agy`. If an in-stream error or connection drop occurs at any point (chunk 1, chunk 2, or later), `agy-gyro` discards the buffered chunks and replays the request with backoff. Zero bytes are leaked to `agy`, providing 100% resilience against mid-stream failures.
-- **Passthrough Mode (`--no-buffer`)**: If immediate chunk streaming is desired for lowest time-to-first-token latency, passing `--no-buffer` peeks at the initial stream chunk (Chunk 1) and immediately pipes subsequent chunks directly to `agy`.
-
-### 6. Dynamic Model Redirection & Remapping
-
-- **URL-Level Remapping**: Rewrites model path segments matching `FROM:TO` rules (e.g. `/v1beta/models/gemini-3.7-flash:streamGenerateContent` -> `/v1beta/models/gemini-3.8-flash:streamGenerateContent`).
-- **Preserves Full Context**: Transparently preserves the request body, including tool call declarations, workspace context, and reasoning configurations (`thinkingConfig` / `thinkingBudget`).
-- **Multi-Rule Support**: Supports mapping multiple models simultaneously using repeated flags or comma-separated environment variables (e.g., remapping Flash and Pro independently).
-- **Zero Overhead on Unmatched Traffic**: Requests that do not match any redirect rule (or non-model management endpoints) pass through without modification.
+Because Gemini REST API schemas (including prompt structures, tool call definitions, and reasoning `thinkingConfig` parameters) are shared across model generations, requests differ primarily by the model identifier in the REST URL. `agy-gyro` enables instant access to new models via transparent model remapping (`--redirect-model`), redirecting outbound requests at the proxy layer without requiring changes to `agy`.
 
 ## Installation
 
@@ -105,7 +70,7 @@ Running `agy-gyro` without subcommands automatically starts an in-process proxy 
 agy-gyro
 
 # Pass arguments directly through to agy:
-agy-gyro -- --model gemini-3.7-flash
+agy-gyro -- --dangerously-skip-permissions
 
 # Redirect requests from one model to another (e.g. gemini-3.7-flash -> gemini-3.8-flash):
 agy-gyro --redirect-model gemini-3.7-flash:gemini-3.8-flash
@@ -161,16 +126,9 @@ Set your Gemini API key and run `agy-gyro`:
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"
 
+# Launch agy normally
 agy-gyro
-```
 
-`agy-gyro` handles local proxy startup, dynamic port binding, environment variable setup (`GOOGLE_GEMINI_BASE_URL`), and signal forwarding seamlessly!
-
-### Step 3: Access Newer Gemini Models (Optional)
-
-To use newer or experimental Gemini models (such as `gemini-3.8-flash`) not yet selectable in `agy`'s static model selector:
-
-```bash
 # Redirect all requests for gemini-3.7-flash to gemini-3.8-flash:
 agy-gyro --redirect-model gemini-3.7-flash:gemini-3.8-flash
 
@@ -179,6 +137,8 @@ agy-gyro \
   --redirect-model gemini-3.7-flash:gemini-3.8-flash \
   --redirect-model gemini-3.5-flash:gemini-3.8-flash
 ```
+
+`agy-gyro` handles local proxy startup, dynamic port binding, environment variable setup (`GOOGLE_GEMINI_BASE_URL`), and signal forwarding seamlessly!
 
 ## Streaming & Error Recovery Behavior
 
@@ -194,15 +154,6 @@ In default mode, `agy-gyro` buffers all incoming stream chunks before delivering
 When running with `--no-buffer`, `agy-gyro` verifies Chunk 1 and immediately streams subsequent tokens to minimize time-to-first-token latency:
 - **Chunk 1 Error**: Retried seamlessly before sending headers to `agy`.
 - **Mid-Stream Error (Chunk $N > 1$)**: Forwarded downstream to prevent duplicated tokens.
-
-### Summary Matrix
-
-| Error Stage                          | Default Buffering Mode                                                       | Passthrough Mode (`--no-buffer`)                                                     |
-| :----------------------------------- | :--------------------------------------------------------------------------- | :----------------------------------------------------------------------------------- |
-| **HTTP Status Error**                | **Retried**: Replays request with exponential backoff & jitter               | **Retried**: Replays request with exponential backoff & jitter                       |
-| **Chunk 1 In-Stream Error**          | **Retried**: Suppresses error chunk & replays request cleanly                | **Retried**: Suppresses error chunk & replays request cleanly                        |
-| **Mid-Stream Error (Chunk $N > 1$)** | **Retried**: Discards partial chunks & replays request cleanly from scratch  | **Forwarded**: Emits error to client to avoid duplicating already-streamed tokens   |
-| **Mid-Stream Connection Drop**       | **Retried**: Discards partial chunks & replays request cleanly from scratch  | **Failed**: Stream ends prematurely with network disconnect                          |
 
 ## License
 
