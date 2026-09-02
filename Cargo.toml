@@ -1,6 +1,6 @@
 [package]
 name = "agy-gyro"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["John Wu <topjohnwu@gmail.com>"]
 description = "Local retry proxy to stabilize the Antigravity CLI (agy) against transient Google Gemini API errors"

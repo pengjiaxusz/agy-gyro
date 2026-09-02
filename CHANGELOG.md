@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-09-02
+
+### Added
+- **Model Redirection (`--redirect-model`)**: Remap Gemini model names in API requests via `--redirect-model <SRC>:<DST>` (or `AGY_GYRO_REDIRECT_MODEL` environment variable), enabling instant access to newer, unlisted, or preview models (such as `gemini-3.8-flash`) without waiting for Antigravity CLI updates.
+- Support for configuring multiple model redirections simultaneously using repeated CLI flags or comma-separated environment variables.
+
 ## [0.1.1] - 2026-08-30
 
 ### Added
@@ -13,10 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--no-buffer` Option**: Added `--no-buffer` command-line flag and `AGY_GYRO_NO_BUFFER` environment variable to allow opting out of stream buffering for minimal time-to-first-token latency.
 - **Enhanced SSE Error Parser**: Line-by-line inspection of incoming chunks to detect Gemini error JSON payloads embedded within composite SSE events.
 - **GitHub Release CI Automation**: Workflow triggers on release creation to automatically compile binaries and attach release archives to GitHub Releases.
-
-### Changed
-- Upgraded dependencies to latest releases (`tokio` 1.53, `reqwest` 0.13 with `rustls`, `clap` 4.6, `rand` 0.10).
-- Updated documentation and streaming behavior matrix in `README.md`.
 
 ## [0.1.0] - 2026-08-29
 
