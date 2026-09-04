@@ -151,9 +151,19 @@ Rank | Node Name                    | Score    | Hourly (S/F)     | Overall (S/F
 | `--redirect-model`             | `AGY_GYRO_REDIRECT_MODEL`           | _None_                                      | Redirect model requests in `FROM:TO` format                 |
 | `--clash-api`                  | `AGY_GYRO_CLASH_API`                | `http://127.0.0.1:9097`                     | Clash external-controller base URL                          |
 | `--clash-secret`               | `AGY_GYRO_CLASH_SECRET`             | `set-your-secret`                           | Clash external-controller secret token                      |
-| `--clash-group`                | `AGY_GYRO_CLASH_GROUP`              | `台美新日`                                  | Clash proxy selector group to rotate nodes within           |
+| `--clash-group`                | `AGY_GYRO_CLASH_GROUP`              | `PROXY`                                     | Clash proxy selector group to rotate nodes within           |
 | `--clash-parent`               | `AGY_GYRO_CLASH_PARENT`             | `GLOBAL`                                    | Clash parent selector group (e.g. `GLOBAL`)                 |
 | `--no-clash-switch`            | `AGY_GYRO_NO_CLASH_SWITCH`          | `false`                                     | Disable automatic Clash node switching on failure           |
+| `--clash-switch-cooldown-secs` | `AGY_GYRO_CLASH_SWITCH_COOLDOWN_SECS`| `5.0`                                      | Cooldown window in seconds between Clash switches           |
+| `--node-quarantine-hours`      | `AGY_GYRO_QUARANTINE_HOURS`         | `12.0`                                      | Duration in hours to quarantine nodes that return 400 location block |
+| `--region-priority`            | `AGY_GYRO_REGION_PRIORITY`          | `美国,日本,台湾,新加坡`                     | Comma-separated Tier 1 region priority hierarchy            |
+| `--region-consecutive-failure-threshold` | `AGY_GYRO_REGION_CONSECUTIVE_FAILURE_THRESHOLD` | `3`               | Consecutive failures before cooling down an entire region   |
+| `--region-failure-cooldown-secs` | `AGY_GYRO_REGION_FAILURE_COOLDOWN_SECS` | `300.0`                          | Duration in seconds to cool down an entire region           |
+| `--no-region-priority`         | `AGY_GYRO_NO_REGION_PRIORITY`       | `false`                                     | Disable Tier 1 region priority hierarchy and use flat mode  |
+| `--no-preflight-probe`         | `AGY_GYRO_NO_PREFLIGHT_PROBE`        | `false`                                     | Disable fast pre-flight probing of candidate nodes before exposing user requests |
+| `--anchor-hysteresis-retries`  | `AGY_GYRO_ANCHOR_HYSTERESIS_RETRIES`| `5`                                         | Maximum local retries on the consensus anchor node before switching Clash proxy |
+| `--consecutive-failure-threshold` | `AGY_GYRO_CONSECUTIVE_FAILURE_THRESHOLD` | `2`                               | Number of consecutive failures before temporarily cooling down a node to explore lower tiers |
+| `--failure-cooldown-secs`       | `AGY_GYRO_FAILURE_COOLDOWN_SECS`    | `180.0`                                     | Duration in seconds to cool down a node after exceeding consecutive failure threshold |
 | `--retry-all`                  | `AGY_GYRO_RETRY_ALL`                | `false`                                     | Retry on all non-2xx responses (including 400/401/403)     |
 | `--stats-file`                 | `AGY_GYRO_STATS_FILE`               | `~/.gemini/antigravity-cli/gyro.db`         | Path to persistent node reliability stats SQLite DB file    |
 | `--no-stats`                   | `AGY_GYRO_NO_STATS`                 | `false`                                     | Disable node statistics collection and priority switching   |

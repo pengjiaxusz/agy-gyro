@@ -49,6 +49,8 @@ async fn spawn_test_proxy_full(
         stats_max_samples: 20.0,
         stats_half_life_days: 7.0,
         stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 5.0,
+        ..Config::default()
     };
 
     let client = Client::builder()
@@ -94,6 +96,8 @@ async fn spawn_test_proxy_retry_all(upstream_url: String, max_retries: u32) -> S
         stats_max_samples: 20.0,
         stats_half_life_days: 7.0,
         stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 5.0,
+        ..Config::default()
     };
     let client = Client::builder()
         .timeout(Duration::from_secs(config.request_timeout_secs))
@@ -694,6 +698,8 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             stats_max_samples: 20.0,
             stats_half_life_days: 7.0,
             stats_burst_window_secs: 15,
+            clash_switch_cooldown_secs: 5.0,
+            ..Config::default()
         },
         agy_path,
         log_file: None,
@@ -1070,7 +1076,7 @@ async fn test_priority_clash_switch_selects_highest_score_node() {
     Mock::given(method("GET"))
         .and(path("/proxies/GLOBAL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "now": "台美新日"
+            "now": "PROXY"
         })))
         .mount(&mock_clash)
         .await;
@@ -1141,6 +1147,8 @@ async fn test_priority_clash_switch_selects_highest_score_node() {
         stats_max_samples: 20.0,
         stats_half_life_days: 7.0,
         stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 0.0,
+        ..Config::default()
     };
 
     let client = Client::builder()
@@ -1273,6 +1281,12 @@ fn test_sqlite_multi_instance_concurrent_writes() {
         20.0,
         7.0 * 86400.0,
         15,
+        180,
+        2,
+        vec!["美国".to_string(), "日本".to_string(), "台湾".to_string(), "新加坡".to_string()],
+        3,
+        300,
+        false,
     );
     let manager_2 = agy_gyro::stats::StatsManager::new(
         Some(db_path.clone()),
@@ -1280,6 +1294,12 @@ fn test_sqlite_multi_instance_concurrent_writes() {
         20.0,
         7.0 * 86400.0,
         15,
+        180,
+        2,
+        vec!["美国".to_string(), "日本".to_string(), "台湾".to_string(), "新加坡".to_string()],
+        3,
+        300,
+        false,
     );
 
     let hour = 15;
@@ -1309,6 +1329,12 @@ fn test_sqlite_multi_instance_concurrent_writes() {
         20.0,
         7.0 * 86400.0,
         15,
+        180,
+        2,
+        vec!["美国".to_string(), "日本".to_string(), "台湾".to_string(), "新加坡".to_string()],
+        3,
+        300,
+        false,
     );
     let snap = manager_3.snapshot();
     let a = snap.nodes.get("node-shared-a").expect("node-shared-a should exist");
@@ -1318,6 +1344,691 @@ fn test_sqlite_multi_instance_concurrent_writes() {
     assert!(b.overall.successes > 0.0);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_clash_switch_cooldown_prevents_thrashing() {
+    let mock_clash = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/GLOBAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "PROXY"
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "Node-Failing",
+            "all": ["Node-Failing", "Node-Good"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    // PUT to switch to Node-Good should be called strictly ONCE because cooldown is 10s
+    Mock::given(method("PUT"))
+        .and(path("/proxies/PROXY"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "name": "Node-Good"
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_clash)
+        .await;
+
+    let mock_upstream = MockServer::start().await;
+
+    // First request fails 3 times on generation path -> triggers Clash switch
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("Overloaded"))
+        .up_to_n_times(3)
+        .mount(&mock_upstream)
+        .await;
+
+    // Fourth request (and subsequent) succeeds
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "Success"}]}}]
+        })))
+        .mount(&mock_upstream)
+        .await;
+
+    let temp_dir = std::env::temp_dir().join(format!("gyro-test-cd-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let stats_path = temp_dir.join("stats.db");
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: Some(0),
+        upstream: mock_upstream.uri(),
+        cloudcode_upstream: mock_upstream.uri(),
+        max_retries: 5,
+        initial_delay_ms: 10,
+        max_delay_ms: 50,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        redirect_model: Vec::new(),
+        clash_api: mock_clash.uri(),
+        clash_secret: "".to_string(),
+        clash_group: "PROXY".to_string(),
+        clash_parent: "GLOBAL".to_string(),
+        no_clash_switch: false,
+        retry_all: false,
+        stats_file: Some(stats_path.clone()),
+        no_stats: false,
+        stats_max_samples: 20.0,
+        stats_half_life_days: 7.0,
+        stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 10.0,
+        ..Config::default()
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .unwrap();
+    let state = Arc::new(ProxyState::new(config, client));
+    let app = create_router(Arc::clone(&state));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let http_client = Client::new();
+    let res = http_client
+        .post(format!(
+            "http://{}/v1beta/models/gemini-2.5-flash:generateContent",
+            bound_addr
+        ))
+        .body("test payload")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_http_429_does_not_penalize_node_reliability() {
+    let mock_upstream = MockServer::start().await;
+
+    // Upstream returns 429 on first try, then 200 on second try
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": "Resource exhausted",
+                "status": "RESOURCE_EXHAUSTED"
+            }
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_upstream)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "Success after 429"}]}}]
+        })))
+        .mount(&mock_upstream)
+        .await;
+
+    let temp_dir = std::env::temp_dir().join(format!("gyro-test-429-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let stats_path = temp_dir.join("stats.db");
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: Some(0),
+        upstream: mock_upstream.uri(),
+        cloudcode_upstream: mock_upstream.uri(),
+        max_retries: 5,
+        initial_delay_ms: 10,
+        max_delay_ms: 50,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        redirect_model: Vec::new(),
+        clash_api: "http://127.0.0.1:9097".to_string(),
+        clash_secret: "".to_string(),
+        clash_group: "PROXY".to_string(),
+        clash_parent: "GLOBAL".to_string(),
+        no_clash_switch: true, // Disable clash switch for isolated 429 check
+        retry_all: false,
+        stats_file: Some(stats_path.clone()),
+        no_stats: false,
+        stats_max_samples: 20.0,
+        stats_half_life_days: 7.0,
+        stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 5.0,
+        ..Config::default()
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .unwrap();
+    let state = Arc::new(ProxyState::new(config, client));
+    let app = create_router(Arc::clone(&state));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let http_client = Client::new();
+    let res = http_client
+        .post(format!(
+            "http://{}/v1beta/models/gemini-2.5-flash:generateContent",
+            bound_addr
+        ))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+
+    // Verify stats: 429 should NOT record failure
+    let snap = state.stats_manager.snapshot();
+    for (_node, s) in &snap.nodes {
+        assert_eq!(s.overall.failures, 0.0, "429 should not count as failure");
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_concurrent_instances_avoid_duplicate_clash_switch() {
+    let mock_clash = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/GLOBAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "PROXY"
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "Node-Failing",
+            "all": ["Node-Failing", "Node-Good"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    // Both concurrent requests fail on Node-Failing, but Clash switch should only be called ONCE
+    Mock::given(method("PUT"))
+        .and(path("/proxies/PROXY"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "name": "Node-Good"
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_clash)
+        .await;
+
+    let mock_upstream = MockServer::start().await;
+
+    // First attempt returns location block 400
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": { "code": 400, "message": "User location is not supported", "status": "FAILED_PRECONDITION" }
+            }))
+        )
+        .up_to_n_times(2)
+        .mount(&mock_upstream)
+        .await;
+
+    // Subsequent attempts succeed
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "Success on Node-Good"}]}}]
+        })))
+        .mount(&mock_upstream)
+        .await;
+
+    let temp_dir = std::env::temp_dir().join(format!("gyro-test-conc-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let stats_path = temp_dir.join("stats.db");
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: Some(0),
+        upstream: mock_upstream.uri(),
+        cloudcode_upstream: mock_upstream.uri(),
+        max_retries: 5,
+        initial_delay_ms: 10,
+        max_delay_ms: 50,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        redirect_model: Vec::new(),
+        clash_api: mock_clash.uri(),
+        clash_secret: "".to_string(),
+        clash_group: "PROXY".to_string(),
+        clash_parent: "GLOBAL".to_string(),
+        no_clash_switch: false,
+        retry_all: false,
+        stats_file: Some(stats_path.clone()),
+        no_stats: false,
+        stats_max_samples: 20.0,
+        stats_half_life_days: 7.0,
+        stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 5.0,
+        ..Config::default()
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .unwrap();
+    let state = Arc::new(ProxyState::new(config, client));
+    let app = create_router(Arc::clone(&state));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let http_client1 = Client::new();
+    let http_client2 = Client::new();
+
+    let req1 = http_client1
+        .post(format!(
+            "http://{}/v1beta/models/gemini-2.5-flash:generateContent",
+            bound_addr
+        ))
+        .body("payload 1")
+        .send();
+
+    let req2 = http_client2
+        .post(format!(
+            "http://{}/v1beta/models/gemini-2.5-flash:generateContent",
+            bound_addr
+        ))
+        .body("payload 2")
+        .send();
+
+    let (res1, res2) = tokio::join!(req1, req2);
+    assert_eq!(res1.unwrap().status(), 200);
+    assert_eq!(res2.unwrap().status(), 200);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_consecutive_failures_demotes_top_node_to_allow_lower_priority_exploration() {
+    let mock_clash = MockServer::start().await;
+    let mock_upstream = MockServer::start().await;
+
+    // Clash group has 3 nodes: Node-TopA, Node-TopB, and Node-LowerC
+    Mock::given(method("GET"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "Node-TopA",
+            "all": ["Node-TopA", "Node-TopB", "Node-LowerC"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/GLOBAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "PROXY",
+            "all": ["PROXY"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock_clash)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "Success"}]}}]
+        })))
+        .mount(&mock_upstream)
+        .await;
+
+    let temp_stats_dir = std::env::temp_dir().join(format!("gyro-test-cf-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_stats_dir);
+    let stats_path = temp_stats_dir.join("stats.db");
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: Some(0),
+        upstream: mock_upstream.uri(),
+        cloudcode_upstream: mock_upstream.uri(),
+        max_retries: 5,
+        initial_delay_ms: 10,
+        max_delay_ms: 50,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        redirect_model: Vec::new(),
+        clash_api: mock_clash.uri(),
+        clash_secret: "".to_string(),
+        clash_group: "PROXY".to_string(),
+        clash_parent: "GLOBAL".to_string(),
+        no_clash_switch: false,
+        retry_all: false,
+        stats_file: Some(stats_path.clone()),
+        no_stats: false,
+        stats_max_samples: 20.0,
+        stats_half_life_days: 7.0,
+        stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 0.0,
+        consecutive_failure_threshold: 2,
+        failure_cooldown_secs: 180.0,
+        ..Config::default()
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .unwrap();
+    let state = Arc::new(ProxyState::new(config, client));
+
+    let hour = agy_gyro::stats::StatsManager::current_hour();
+    // Pre-populate stats:
+    // Node-TopA: 20 successes (historical favorite)
+    // Node-TopB: 15 successes (historical second)
+    // Node-LowerC: 0 requests (untried, score 50%)
+    for _ in 0..20 {
+        state.stats_manager.record_success("Node-TopA", hour);
+    }
+    for _ in 0..15 {
+        state.stats_manager.record_success("Node-TopB", hour);
+    }
+
+    let candidates = vec![
+        "Node-TopA".to_string(),
+        "Node-TopB".to_string(),
+        "Node-LowerC".to_string(),
+    ];
+
+    // Initially, Node-TopA is #1, Node-TopB is #2, Node-LowerC is #3
+    let ranked_init = state.stats_manager.rank_nodes(hour, &candidates);
+    assert_eq!(ranked_init[0].0, "Node-TopA");
+    assert_eq!(ranked_init[1].0, "Node-TopB");
+    assert_eq!(ranked_init[2].0, "Node-LowerC");
+
+    // Both Node-TopA and Node-TopB suffer 2 consecutive failures
+    state.stats_manager.record_failure("Node-TopA", hour);
+    state.stats_manager.record_failure("Node-TopA", hour);
+    state.stats_manager.record_failure("Node-TopB", hour);
+    state.stats_manager.record_failure("Node-TopB", hour);
+
+    let now_sec = agy_gyro::stats::StatsManager::now_sec();
+    assert!(state.stats_manager.is_cooling_down("Node-TopA", now_sec));
+    assert!(state.stats_manager.is_cooling_down("Node-TopB", now_sec));
+
+    // After cooling down, rank_nodes demotes both Node-TopA and Node-TopB below Node-LowerC!
+    let ranked_after = state.stats_manager.rank_nodes(hour, &candidates);
+    assert_eq!(ranked_after[0].0, "Node-LowerC");
+
+    // select_best_node automatically chooses Node-LowerC without ping-ponging!
+    let chosen = state.stats_manager.select_best_node(hour, &candidates, &[], None);
+    assert_eq!(chosen, Some("Node-LowerC".to_string()));
+
+    let _ = std::fs::remove_dir_all(&temp_stats_dir);
+}
+
+#[tokio::test]
+async fn test_location_block_quarantined_for_12_hours() {
+    let mock_clash = MockServer::start().await;
+    let mock_upstream = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "Node-HK",
+            "all": ["Node-HK", "Node-US"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/GLOBAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "PROXY",
+            "all": ["PROXY"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock_clash)
+        .await;
+
+    // Node-HK returns 400 location block
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": { "code": 400, "message": "User location is not supported", "status": "FAILED_PRECONDITION" }
+            }))
+        )
+        .up_to_n_times(1)
+        .mount(&mock_upstream)
+        .await;
+
+    // Node-US succeeds
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "Success on Node-US"}]}}]
+        })))
+        .mount(&mock_upstream)
+        .await;
+
+    let temp_stats_dir = std::env::temp_dir().join(format!("gyro-test-quarantine-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_stats_dir);
+    let stats_path = temp_stats_dir.join("stats.db");
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: Some(0),
+        upstream: mock_upstream.uri(),
+        cloudcode_upstream: mock_upstream.uri(),
+        max_retries: 5,
+        initial_delay_ms: 10,
+        max_delay_ms: 50,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        redirect_model: Vec::new(),
+        clash_api: mock_clash.uri(),
+        clash_secret: "".to_string(),
+        clash_group: "PROXY".to_string(),
+        clash_parent: "GLOBAL".to_string(),
+        no_clash_switch: false,
+        retry_all: false,
+        stats_file: Some(stats_path.clone()),
+        no_stats: false,
+        stats_max_samples: 20.0,
+        stats_half_life_days: 7.0,
+        stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 0.0,
+        node_quarantine_hours: 12.0,
+        no_preflight_probe: true, // test direct switch behavior
+        ..Config::default()
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .unwrap();
+    let state = Arc::new(ProxyState::new(config, client));
+    let app = create_router(Arc::clone(&state));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let http_client = Client::new();
+    let resp = http_client
+        .post(format!(
+            "http://{}/v1beta/models/gemini-2.5-flash:generateContent",
+            bound_addr
+        ))
+        .body("test payload")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Success on Node-US"));
+
+    // Verify Node-HK is quarantined for ~12 hours
+    let now_sec = agy_gyro::stats::StatsManager::now_sec();
+    assert!(state.stats_manager.is_quarantined("Node-HK", now_sec));
+    let q_nodes = state.stats_manager.get_quarantined_nodes(now_sec);
+    assert!(q_nodes.iter().any(|(n, rem, _)| n == "Node-HK" && *rem > 40000));
+
+    let _ = std::fs::remove_dir_all(&temp_stats_dir);
+}
+
+#[tokio::test]
+async fn test_anchor_hysteresis_survives_transient_503() {
+    let mock_clash = MockServer::start().await;
+    let mock_upstream = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "Node-Anchor",
+            "all": ["Node-Anchor", "Node-Other"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxies/GLOBAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "PROXY",
+            "all": ["PROXY"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    // Clash PUT should NEVER be called because hysteresis retries absorb the transient 503 errors!
+    Mock::given(method("PUT"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&mock_clash)
+        .await;
+
+    // First 2 requests return 503, 3rd succeeds
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+        .up_to_n_times(2)
+        .mount(&mock_upstream)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "Anchor Succeeded"}]}}]
+        })))
+        .mount(&mock_upstream)
+        .await;
+
+    let temp_stats_dir = std::env::temp_dir().join(format!("gyro-test-anchor-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_stats_dir);
+    let stats_path = temp_stats_dir.join("stats.db");
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: Some(0),
+        upstream: mock_upstream.uri(),
+        cloudcode_upstream: mock_upstream.uri(),
+        max_retries: 5,
+        initial_delay_ms: 10,
+        max_delay_ms: 50,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        redirect_model: Vec::new(),
+        clash_api: mock_clash.uri(),
+        clash_secret: "".to_string(),
+        clash_group: "PROXY".to_string(),
+        clash_parent: "GLOBAL".to_string(),
+        no_clash_switch: false,
+        retry_all: false,
+        stats_file: Some(stats_path.clone()),
+        no_stats: false,
+        stats_max_samples: 20.0,
+        stats_half_life_days: 7.0,
+        stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 5.0,
+        anchor_hysteresis_retries: 5,
+        ..Config::default()
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .unwrap();
+    let state = Arc::new(ProxyState::new(config, client));
+
+    // Designate Node-Anchor as the consensus anchor
+    state.stats_manager.set_consensus_anchor("Node-Anchor");
+    state.set_active_node("Node-Anchor".to_string()).await;
+
+    let app = create_router(Arc::clone(&state));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let http_client = Client::new();
+    let resp = http_client
+        .post(format!(
+            "http://{}/v1beta/models/gemini-2.5-flash:generateContent",
+            bound_addr
+        ))
+        .body("test payload")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Anchor Succeeded"));
+
+    let _ = std::fs::remove_dir_all(&temp_stats_dir);
 }
 
 

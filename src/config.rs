@@ -141,13 +141,34 @@ pub struct Config {
     #[arg(long, env = "AGY_GYRO_CLASH_SECRET", default_value = "set-your-secret")]
     pub clash_secret: String,
 
-    /// Clash proxy group to rotate inside (e.g. 台美新日)
-    #[arg(long, env = "AGY_GYRO_CLASH_GROUP", default_value = "台美新日")]
+    /// Clash proxy group to rotate inside (e.g. PROXY)
+    #[arg(long, env = "AGY_GYRO_CLASH_GROUP", default_value = "PROXY")]
     pub clash_group: String,
 
     /// Clash parent selector to ensure it points to clash_group (e.g. GLOBAL)
     #[arg(long, env = "AGY_GYRO_CLASH_PARENT", default_value = "GLOBAL")]
     pub clash_parent: String,
+
+    /// Comma-separated two-tier region priority list (e.g. "美国,日本,台湾,新加坡")
+    #[arg(
+        long,
+        env = "AGY_GYRO_REGION_PRIORITY",
+        value_delimiter = ',',
+        default_value = "美国,日本,台湾,新加坡"
+    )]
+    pub region_priority: Vec<String>,
+
+    /// Consecutive failure threshold for an entire region before cooling it down (default: 3)
+    #[arg(long, env = "AGY_GYRO_REGION_CONSECUTIVE_FAILURE_THRESHOLD", default_value_t = 3)]
+    pub region_consecutive_failure_threshold: u32,
+
+    /// Cooldown duration in seconds for a region after reaching failure threshold (default: 300.0s / 5 min)
+    #[arg(long, env = "AGY_GYRO_REGION_FAILURE_COOLDOWN_SECS", default_value_t = 300.0)]
+    pub region_failure_cooldown_secs: f64,
+
+    /// Disable two-tier region priority switching (flat node priority fallback)
+    #[arg(long, env = "AGY_GYRO_NO_REGION_PRIORITY", default_value_t = false)]
+    pub no_region_priority: bool,
 
     /// Disable Clash auto-switch on retry
     #[arg(long, env = "AGY_GYRO_NO_CLASH_SWITCH", default_value_t = false)]
@@ -176,6 +197,30 @@ pub struct Config {
     /// Burst window in seconds to damp rapid-fire consecutive requests
     #[arg(long, env = "AGY_GYRO_STATS_BURST_WINDOW_SECS", default_value_t = 15)]
     pub stats_burst_window_secs: i64,
+
+    /// Cooldown window in seconds between Clash proxy node switches to prevent multi-instance switching storms
+    #[arg(long, env = "AGY_GYRO_CLASH_SWITCH_COOLDOWN_SECS", default_value_t = 5.0)]
+    pub clash_switch_cooldown_secs: f64,
+
+    /// Duration in hours to quarantine nodes that return 400 location block (default: 12.0 hours)
+    #[arg(long, env = "AGY_GYRO_QUARANTINE_HOURS", default_value_t = 12.0)]
+    pub node_quarantine_hours: f64,
+
+    /// Disable fast pre-flight probing of candidate nodes before exposing user requests
+    #[arg(long, env = "AGY_GYRO_NO_PREFLIGHT_PROBE", default_value_t = false)]
+    pub no_preflight_probe: bool,
+
+    /// Maximum local retries on the consensus anchor node before switching Clash proxy (default: 5)
+    #[arg(long, env = "AGY_GYRO_ANCHOR_HYSTERESIS_RETRIES", default_value_t = 5)]
+    pub anchor_hysteresis_retries: u32,
+
+    /// Number of consecutive failures before temporarily cooling down a node to let lower-priority nodes be tried (default: 2)
+    #[arg(long, env = "AGY_GYRO_CONSECUTIVE_FAILURE_THRESHOLD", default_value_t = 2)]
+    pub consecutive_failure_threshold: u32,
+
+    /// Duration in seconds to cool down a node after exceeding consecutive failure threshold (default: 180.0s / 3 min)
+    #[arg(long, env = "AGY_GYRO_FAILURE_COOLDOWN_SECS", default_value_t = 180.0)]
+    pub failure_cooldown_secs: f64,
 }
 
 impl Config {
@@ -185,6 +230,22 @@ impl Config {
 
     pub fn is_buffer_enabled(&self) -> bool {
         !self.no_buffer
+    }
+
+    pub fn is_preflight_probe_enabled(&self) -> bool {
+        !self.no_preflight_probe
+    }
+
+    pub fn node_quarantine_secs(&self) -> i64 {
+        (self.node_quarantine_hours * 3600.0).max(0.0) as i64
+    }
+
+    pub fn failure_cooldown_duration_secs(&self) -> i64 {
+        self.failure_cooldown_secs.max(0.0) as i64
+    }
+
+    pub fn clash_switch_cooldown_ms(&self) -> i64 {
+        (self.clash_switch_cooldown_secs * 1000.0).max(0.0) as i64
     }
 
     pub fn model_redirects(&self) -> Vec<(&str, &str)> {
@@ -200,7 +261,59 @@ impl Config {
             .unwrap_or_else(crate::stats::resolve_default_stats_path)
     }
 
+    pub fn region_failure_cooldown_duration_secs(&self) -> i64 {
+        self.region_failure_cooldown_secs.max(0.0) as i64
+    }
+
+    pub fn is_region_priority_enabled(&self) -> bool {
+        !self.no_region_priority
+    }
+
     pub fn stats_half_life_secs(&self) -> f64 {
         self.stats_half_life_days * 86400.0
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: None,
+            upstream: "https://generativelanguage.googleapis.com".to_string(),
+            cloudcode_upstream: "https://daily-cloudcode-pa.googleapis.com".to_string(),
+            max_retries: 10000,
+            initial_delay_ms: 200,
+            max_delay_ms: 3000,
+            no_jitter: false,
+            no_buffer: false,
+            request_timeout_secs: 600,
+            redirect_model: Vec::new(),
+            clash_api: "http://127.0.0.1:9097".to_string(),
+            clash_secret: "set-your-secret".to_string(),
+            clash_group: "PROXY".to_string(),
+            clash_parent: "GLOBAL".to_string(),
+            region_priority: vec![
+                "美国".to_string(),
+                "日本".to_string(),
+                "台湾".to_string(),
+                "新加坡".to_string(),
+            ],
+            region_consecutive_failure_threshold: 3,
+            region_failure_cooldown_secs: 300.0,
+            no_region_priority: false,
+            no_clash_switch: false,
+            retry_all: false,
+            stats_file: None,
+            no_stats: false,
+            stats_max_samples: 20.0,
+            stats_half_life_days: 7.0,
+            stats_burst_window_secs: 15,
+            clash_switch_cooldown_secs: 5.0,
+            node_quarantine_hours: 12.0,
+            no_preflight_probe: false,
+            anchor_hysteresis_retries: 5,
+            consecutive_failure_threshold: 2,
+            failure_cooldown_secs: 180.0,
+        }
     }
 }
