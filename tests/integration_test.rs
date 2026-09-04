@@ -42,6 +42,7 @@ async fn spawn_test_proxy_full(
         clash_group: "台美新日".to_string(),
         clash_parent: "GLOBAL".to_string(),
         no_clash_switch: true,
+        retry_all: false,
     };
 
     let client = Client::builder()
@@ -604,6 +605,25 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
     use agy_gyro::config::{Config, WrapperArgs};
     use agy_gyro::runner::run_wrapper;
 
+    // Cross-platform: use `sh` on Unix, `cmd` on Windows
+    let (agy_path, agy_args) = if cfg!(unix) {
+        (
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                r#"test -n "$GOOGLE_GEMINI_BASE_URL" && exit 42"#.to_string(),
+            ],
+        )
+    } else {
+        (
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                "if defined GOOGLE_GEMINI_BASE_URL exit 42".to_string(),
+            ],
+        )
+    };
+
     let wrapper_args = WrapperArgs {
         config: Config {
             host: "127.0.0.1".to_string(),
@@ -621,13 +641,11 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             clash_group: "台美新日".to_string(),
             clash_parent: "GLOBAL".to_string(),
             no_clash_switch: true,
+            retry_all: false,
         },
-        agy_path: "sh".to_string(),
+        agy_path,
         log_file: None,
-        agy_args: vec![
-            "-c".to_string(),
-            r#"test -n "$GOOGLE_GEMINI_BASE_URL" && exit 42"#.to_string(),
-        ],
+        agy_args,
     };
 
     let exit_code = run_wrapper(wrapper_args).await.unwrap();

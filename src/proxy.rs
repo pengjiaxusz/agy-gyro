@@ -2,8 +2,9 @@
 
 use crate::config::Config;
 use crate::retry::{
-    calculate_backoff, is_location_block_error, is_retriable_error, is_retriable_status,
-    parse_in_stream_error, parse_retry_after,
+    calculate_backoff, is_empty_candidate_response, is_location_block_error,
+    is_retriable_aggressive, is_retriable_error, is_retriable_in_stream_with_flag,
+    is_retriable_status, parse_in_stream_error, parse_retry_after,
 };
 use axum::{
     Router,
@@ -59,7 +60,7 @@ async fn trigger_clash_switch(state: &Arc<ProxyState>) {
     let client = match reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build() {
         Ok(c) => c,
         Err(e) => {
-            warn!("Clash switch: failed to build client: {}", e);
+            error!("Clash switch: failed to build client: {} (check AGY_GYRO_CLASH_API)", e);
             return;
         }
     };
@@ -77,63 +78,100 @@ async fn trigger_clash_switch(state: &Arc<ProxyState>) {
             headers.insert(reqwest::header::AUTHORIZATION, val);
         }
     }
-    // Best-effort: switch parent
+    // Best-effort: switch parent with verification
     match client.get(&parent_url).headers(headers.clone()).send().await {
         Ok(resp) if resp.status().is_success() => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("");
-                if now != group {
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("");
+                    if now != group {
+                        let res = client
+                            .put(&parent_url)
+                            .headers(headers.clone())
+                            .json(&serde_json::json!({"name": group}))
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                info!("Clash switch: {}: {} -> {}", parent, now, group)
+                            }
+                            Ok(r) => {
+                                let status = r.status();
+                                let body = r.text().await.unwrap_or_default();
+                                error!("Clash switch parent failed: {} {} (api={}, parent={})", status, body, api, parent)
+                            },
+                            Err(e) => error!("Clash switch parent error: {} (api={}, parent={})", e, api, parent),
+                        }
+                    } else {
+                        debug!("Clash parent {} already at {}", parent, group);
+                    }
+                }
+                Err(e) => warn!("Clash get parent json parse failed: {} (api={})", e, api),
+            }
+        }
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            error!("Clash get parent failed: {} {} (api={}, parent={})", status, body, api, parent)
+        },
+        Err(e) => error!("Clash get parent error: {} (api={}, parent={} - check Clash running?)", e, api, parent),
+    }
+    // 2. Rotate inside group with verification
+    match client.get(&group_url).headers(headers.clone()).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    let all = json.get("all").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let all_str: Vec<String> = all.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                    if all_str.is_empty() {
+                        error!("Clash switch: group {} has no nodes (api={})", group, api);
+                        return;
+                    }
+                    let idx = all_str.iter().position(|n| n == &now).map(|i| (i + 1) % all_str.len()).unwrap_or(0);
+                    let nxt = &all_str[idx];
+                    if nxt == &now && all_str.len() == 1 {
+                        info!("Clash switch: {} only one node {}, staying", group, now);
+                        return;
+                    }
+                    // If now not found, nxt is first node - still switch
                     let res = client
-                        .put(&parent_url)
-                        .headers(headers.clone())
-                        .json(&serde_json::json!({"name": group}))
+                        .put(&group_url)
+                        .headers(headers)
+                        .json(&serde_json::json!({"name": nxt}))
                         .send()
                         .await;
                     match res {
                         Ok(r) if r.status().is_success() => {
-                            info!("Clash switch: {}: {} -> {}", parent, now, group)
-                        }
-                        Ok(r) => warn!("Clash switch parent failed: {} {}", r.status(), r.text().await.unwrap_or_default()),
-                        Err(e) => warn!("Clash switch parent error: {}", e),
+                            info!("Clash switch: {}: {} -> {}", group, now, nxt);
+                            // Verify switch
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            if let Ok(verify) = client.get(&group_url).send().await {
+                                if let Ok(vjson) = verify.json::<serde_json::Value>().await {
+                                    let verified = vjson.get("now").and_then(|v| v.as_str()).unwrap_or("");
+                                    if verified != nxt {
+                                        warn!("Clash switch verify failed: expected {} but got {}", nxt, verified);
+                                    }
+                                }
+                            }
+                        },
+                        Ok(r) => {
+                            let status = r.status();
+                            let body = r.text().await.unwrap_or_default();
+                            error!("Clash switch group failed: {} {} (group={}, api={})", status, body, group, api)
+                        },
+                        Err(e) => error!("Clash switch group error: {} (group={}, api={})", e, group, api),
                     }
                 }
+                Err(e) => warn!("Clash get group json parse failed: {} (api={})", e, api),
             }
         }
-        Ok(r) => warn!("Clash get parent failed: {}", r.status()),
-        Err(e) => warn!("Clash get parent error: {}", e),
-    }
-    // 2. Rotate inside group
-    match client.get(&group_url).headers(headers.clone()).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                let all = json.get("all").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let all_str: Vec<String> = all.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-                if all_str.is_empty() {
-                    warn!("Clash switch: group {} has no nodes", group);
-                    return;
-                }
-                let idx = all_str.iter().position(|n| n == &now).map(|i| (i + 1) % all_str.len()).unwrap_or(0);
-                let nxt = &all_str[idx];
-                if nxt == &now {
-                    info!("Clash switch: {} already at {}", group, now);
-                    return;
-                }
-                let res = client
-                    .put(&group_url)
-                    .headers(headers)
-                    .json(&serde_json::json!({"name": nxt}))
-                    .send()
-                    .await;
-                match res {
-                    Ok(r) if r.status().is_success() => info!("Clash switch: {}: {} -> {}", group, now, nxt),
-                    Ok(r) => warn!("Clash switch group failed: {} {}", r.status(), r.text().await.unwrap_or_default()),
-                    Err(e) => warn!("Clash switch group error: {}", e),
-                }
-            }
-        }
-        Ok(r) => warn!("Clash get group failed: {}", r.status()),
-        Err(e) => warn!("Clash get group error: {}", e),
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            error!("Clash get group failed: {} {} (group={}, api={})", status, body, group, api)
+        },
+        Err(e) => error!("Clash get group error: {} (group={}, api={} - check Clash running?)", e, group, api),
     }
 }
 
@@ -364,6 +402,70 @@ pub async fn proxy_handler(
                                 .into_response()
                         }
                     };
+                } else if state.config.retry_all && !status.is_success() {
+                    // Aggressive mode: retry on any 4xx/5xx (e.g. 401/403/404 and expanded location-block) with Clash switch
+                    let mut snippet = String::new();
+                    if let Ok(Some(chunk)) = upstream_res.chunk().await {
+                        let bytes = &chunk[..chunk.len().min(512)];
+                        snippet = String::from_utf8_lossy(bytes).trim().to_string();
+                        if chunk.len() > 512 {
+                            snippet.push_str("...");
+                        }
+                    }
+                    // is_retriable_aggressive already covers 4xx/5xx + location-block; for retry_all we retry all non-2xx
+                    let is_aggressive_retriable = is_retriable_aggressive(status, &snippet);
+                    if is_aggressive_retriable {
+                        if attempt < max_retries {
+                            let delay = calculate_backoff(
+                                attempt,
+                                initial_delay,
+                                max_delay,
+                                with_jitter,
+                                None,
+                            );
+                            warn!(
+                                "Upstream returned aggressive-retriable status {} for {} {}. Snippet: {}. Retrying in {:?} (attempt {}/{}) with Clash switch",
+                                status, method, target_url, snippet, delay, attempt + 1, max_retries
+                            );
+                            trigger_clash_switch(&state).await;
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            warn!(
+                                "Max retries ({}) reached for aggressive status {}. Forwarding to client. Snippet: {}",
+                                max_retries, status, snippet
+                            );
+                        }
+                    } else {
+                        debug!(
+                            "Request {} {} returned non-retriable status {} (aggressive check false): {}",
+                            method, target_url, status, snippet
+                        );
+                    }
+                    // Forward the error response to client (after retries exhausted or not retriable)
+                    let mut client_res_builder = Response::builder().status(status.as_u16());
+                    for (name, val) in upstream_res.headers() {
+                        if !is_hop_by_hop(name) {
+                            client_res_builder = client_res_builder.header(name, val);
+                        }
+                    }
+                    let body = if snippet.is_empty() {
+                        Body::empty()
+                    } else {
+                        Body::from(snippet)
+                    };
+                    return match client_res_builder.body(body) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            error!("Failed to build proxy response: {}", err);
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build proxy response: {}", err),
+                            )
+                                .into_response()
+                        }
+                    };
                 } else if status.is_success() {
                     if attempt > 0 {
                         info!(
@@ -405,8 +507,11 @@ pub async fn proxy_handler(
                             Ok(chunk) => {
                                 if let Some((in_stream_status, err_msg)) =
                                     parse_in_stream_error(&chunk).filter(|(status, msg)| {
-                                        is_retriable_status(*status)
-                                            || is_location_block_error(*status, msg)
+                                        is_retriable_in_stream_with_flag(
+                                            *status,
+                                            msg,
+                                            state.config.retry_all,
+                                        )
                                     })
                                 {
                                     in_stream_err_details =
@@ -495,6 +600,71 @@ pub async fn proxy_handler(
                             )
                                 .into_response();
                         }
+                    } else {
+                        // Detect empty candidate response (200 but no meaningful content) - treat as retriable
+                        let combined_len: usize = buffered_chunks.iter().map(|c| c.len()).sum();
+                        let should_check_empty = if buffered_chunks.is_empty() {
+                            // No chunks at all - check if status was 2xx and path is generateContent
+                            true
+                        } else {
+                            combined_len > 0
+                        };
+                        if should_check_empty {
+                            let combined_bytes = if buffered_chunks.is_empty() {
+                                Vec::new()
+                            } else {
+                                let mut v = Vec::with_capacity(combined_len);
+                                for c in &buffered_chunks {
+                                    v.extend_from_slice(c);
+                                }
+                                v
+                            };
+                            // Empty body with success status is retriable (Gemini blank response bug)
+                            let is_empty = if buffered_chunks.is_empty() {
+                                true
+                            } else {
+                                is_empty_candidate_response(&combined_bytes)
+                            };
+                            if is_empty {
+                                // Only retry for model generation endpoints (avoid retrying unrelated 200 empty like /models list)
+                                let is_generation_path = effective_path.contains(":generateContent")
+                                    || effective_path.contains(":streamGenerateContent")
+                                    || effective_path.contains(":countTokens")
+                                    || effective_path.contains(":embedContent");
+                                if is_generation_path {
+                                    if attempt < max_retries {
+                                        let delay = calculate_backoff(
+                                            attempt,
+                                            initial_delay,
+                                            max_delay,
+                                            with_jitter,
+                                            None,
+                                        );
+                                        warn!(
+                                            "Upstream returned empty candidate response ({} bytes, {} chunks) for {} {}. Retrying in {:?} (attempt {}/{}) with Clash switch...",
+                                            combined_len,
+                                            buffered_chunks.len(),
+                                            method,
+                                            target_url,
+                                            delay,
+                                            attempt + 1,
+                                            max_retries
+                                        );
+                                        trigger_clash_switch(&state).await;
+                                        tokio::time::sleep(delay).await;
+                                        attempt += 1;
+                                        continue;
+                                    } else {
+                                        warn!(
+                                            "Max retries ({}) reached for empty candidate response. Forwarding to client.",
+                                            max_retries
+                                        );
+                                    }
+                                } else {
+                                    debug!("Empty 200 response for non-generation path {}, forwarding", effective_path);
+                                }
+                            }
+                        }
                     }
 
                     // All chunks buffered cleanly (or retries exhausted) - stream buffered chunks to client
@@ -518,14 +688,36 @@ pub async fn proxy_handler(
                     };
                 }
 
-                // Passthrough mode (--no-buffer): Peek at the initial stream chunk to catch in-stream 503 / 429 errors early
+                // Passthrough mode (--no-buffer): Peek at the initial stream chunk to catch in-stream 503 / 429 errors early + empty candidate
+                // Note: Only check the FIRST SSE event in the chunk to avoid coalescing mid-stream errors into first_chunk.
                 match stream.next().await {
                     Some(Ok(first_chunk)) => {
-                        if let Some((in_stream_status, err_msg)) =
-                            parse_in_stream_error(&first_chunk).filter(|(status, msg)| {
-                                is_retriable_status(*status)
-                                    || is_location_block_error(*status, msg)
-                            })
+                        let first_event_err = {
+                            // Extract first data: line only
+                            let text = String::from_utf8_lossy(&first_chunk);
+                            let mut first_data: Option<String> = None;
+                            for line in text.lines() {
+                                let trimmed = line.trim();
+                                if let Some(stripped) = trimmed.strip_prefix("data:") {
+                                    let json_str = stripped.trim();
+                                    if json_str.starts_with('{') || json_str.starts_with('[') {
+                                        first_data = Some(json_str.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                            first_data
+                                .as_deref()
+                                .and_then(|s| crate::retry::parse_in_stream_error(s.as_bytes()))
+                                .filter(|(st, msg)| {
+                                    is_retriable_in_stream_with_flag(
+                                        *st,
+                                        msg,
+                                        state.config.retry_all,
+                                    )
+                                })
+                        };
+                        if let Some((in_stream_status, err_msg)) = first_event_err
                         {
                             if attempt < max_retries {
                                 let delay = calculate_backoff(
@@ -556,6 +748,56 @@ pub async fn proxy_handler(
                                     "Max retries ({}) reached for in-stream error {}. Forwarding stream to client.",
                                     max_retries, in_stream_status
                                 );
+                            }
+                        }
+
+                        // Detect empty candidate on first chunk (Gemini blank response bug) - retry before streaming
+                        // Only inspect first SSE event to avoid coalesced mid-stream false positive
+                        let first_chunk_is_empty = {
+                            let text = String::from_utf8_lossy(&first_chunk);
+                            let mut first_data: Option<Vec<u8>> = None;
+                            for line in text.lines() {
+                                let trimmed = line.trim();
+                                if let Some(stripped) = trimmed.strip_prefix("data:") {
+                                    let json_str = stripped.trim();
+                                    if json_str.starts_with('{') || json_str.starts_with('[') {
+                                        first_data = Some(json_str.as_bytes().to_vec());
+                                        break;
+                                    }
+                                }
+                                if !trimmed.is_empty() && !trimmed.starts_with(':') {
+                                    // Raw JSON without data: prefix
+                                    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                                        first_data = Some(trimmed.as_bytes().to_vec());
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(d) = first_data {
+                                is_empty_candidate_response(&d)
+                            } else {
+                                is_empty_candidate_response(&first_chunk)
+                            }
+                        };
+                        if first_chunk_is_empty {
+                            let is_generation_path = effective_path.contains(":generateContent")
+                                || effective_path.contains(":streamGenerateContent");
+                            if is_generation_path && attempt < max_retries {
+                                let delay = calculate_backoff(
+                                    attempt,
+                                    initial_delay,
+                                    max_delay,
+                                    with_jitter,
+                                    None,
+                                );
+                                warn!(
+                                    "Upstream returned empty candidate in first chunk for {} {}. Retrying in {:?} (attempt {}/{}) with Clash switch...",
+                                    method, target_url, delay, attempt + 1, max_retries
+                                );
+                                trigger_clash_switch(&state).await;
+                                tokio::time::sleep(delay).await;
+                                attempt += 1;
+                                continue;
                             }
                         }
 
@@ -616,7 +858,26 @@ pub async fn proxy_handler(
                         }
                     }
                     None => {
-                        // Empty response body
+                        // Empty response body - treat as retriable for generation endpoints (Gemini blank bug)
+                        let is_generation_path = effective_path.contains(":generateContent")
+                            || effective_path.contains(":streamGenerateContent");
+                        if is_generation_path && attempt < max_retries {
+                            let delay = calculate_backoff(
+                                attempt,
+                                initial_delay,
+                                max_delay,
+                                with_jitter,
+                                None,
+                            );
+                            warn!(
+                                "Upstream returned empty body (no chunks) for {} {}. Retrying in {:?} (attempt {}/{}) with Clash switch...",
+                                method, target_url, delay, attempt + 1, max_retries
+                            );
+                            trigger_clash_switch(&state).await;
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        }
                         return match client_res_builder.body(Body::empty()) {
                             Ok(res) => res,
                             Err(err) => (
