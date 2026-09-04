@@ -2,14 +2,14 @@
 
 use crate::config::Config;
 use crate::retry::{
-    calculate_backoff, is_retriable_error, is_retriable_status, parse_in_stream_error,
-    parse_retry_after,
+    calculate_backoff, is_location_block_error, is_retriable_error, is_retriable_status,
+    parse_in_stream_error, parse_retry_after,
 };
 use axum::{
     Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, OriginalUri, State},
-    http::{HeaderMap, HeaderName, Method, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -45,6 +45,96 @@ pub fn build_http_client(config: &Config) -> reqwest::Result<reqwest::Client> {
         .http2_keep_alive_while_idle(true)
         .tcp_nodelay(true)
         .build()
+}
+
+async fn trigger_clash_switch(state: &Arc<ProxyState>) {
+    if state.config.no_clash_switch {
+        return;
+    }
+    let api = state.config.clash_api.trim_end_matches('/');
+    let secret = state.config.clash_secret.clone();
+    let group = state.config.clash_group.clone();
+    let parent = state.config.clash_parent.clone();
+    // Use a fresh client without proxy to talk to local Clash API
+    let client = match reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Clash switch: failed to build client: {}", e);
+            return;
+        }
+    };
+    let auth = if secret.is_empty() {
+        None
+    } else {
+        Some(format!("Bearer {}", secret))
+    };
+    // 1. Ensure parent points to group
+    let parent_url = format!("{}/proxies/{}", api, parent);
+    let group_url = format!("{}/proxies/{}", api, group);
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = &auth {
+        if let Ok(val) = token.parse::<HeaderValue>() {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+    }
+    // Best-effort: switch parent
+    match client.get(&parent_url).headers(headers.clone()).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("");
+                if now != group {
+                    let res = client
+                        .put(&parent_url)
+                        .headers(headers.clone())
+                        .json(&serde_json::json!({"name": group}))
+                        .send()
+                        .await;
+                    match res {
+                        Ok(r) if r.status().is_success() => {
+                            info!("Clash switch: {}: {} -> {}", parent, now, group)
+                        }
+                        Ok(r) => warn!("Clash switch parent failed: {} {}", r.status(), r.text().await.unwrap_or_default()),
+                        Err(e) => warn!("Clash switch parent error: {}", e),
+                    }
+                }
+            }
+        }
+        Ok(r) => warn!("Clash get parent failed: {}", r.status()),
+        Err(e) => warn!("Clash get parent error: {}", e),
+    }
+    // 2. Rotate inside group
+    match client.get(&group_url).headers(headers.clone()).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let all = json.get("all").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let all_str: Vec<String> = all.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                if all_str.is_empty() {
+                    warn!("Clash switch: group {} has no nodes", group);
+                    return;
+                }
+                let idx = all_str.iter().position(|n| n == &now).map(|i| (i + 1) % all_str.len()).unwrap_or(0);
+                let nxt = &all_str[idx];
+                if nxt == &now {
+                    info!("Clash switch: {} already at {}", group, now);
+                    return;
+                }
+                let res = client
+                    .put(&group_url)
+                    .headers(headers)
+                    .json(&serde_json::json!({"name": nxt}))
+                    .send()
+                    .await;
+                match res {
+                    Ok(r) if r.status().is_success() => info!("Clash switch: {}: {} -> {}", group, now, nxt),
+                    Ok(r) => warn!("Clash switch group failed: {} {}", r.status(), r.text().await.unwrap_or_default()),
+                    Err(e) => warn!("Clash switch group error: {}", e),
+                }
+            }
+        }
+        Ok(r) => warn!("Clash get group failed: {}", r.status()),
+        Err(e) => warn!("Clash get group error: {}", e),
+    }
 }
 
 pub fn create_router(state: Arc<ProxyState>) -> Router {
@@ -202,6 +292,7 @@ pub async fn proxy_handler(
                             snippet
                         );
 
+                        trigger_clash_switch(&state).await;
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;
@@ -211,6 +302,68 @@ pub async fn proxy_handler(
                             max_retries, status
                         );
                     }
+                } else if status == StatusCode::BAD_REQUEST {
+                    // Handle 400 location block as retriable with Clash switch
+                    let mut snippet = String::new();
+                    if let Ok(Some(chunk)) = upstream_res.chunk().await {
+                        let bytes = &chunk[..chunk.len().min(512)];
+                        snippet = String::from_utf8_lossy(bytes).trim().to_string();
+                        if chunk.len() > 512 {
+                            snippet.push_str("...");
+                        }
+                    }
+                    if is_location_block_error(status, &snippet) {
+                        if attempt < max_retries {
+                            let delay = calculate_backoff(
+                                attempt,
+                                initial_delay,
+                                max_delay,
+                                with_jitter,
+                                None,
+                            );
+                            warn!(
+                                "Upstream returned location-block 400 for {} {}. Snippet: {}. Retrying in {:?} (attempt {}/{}) with Clash switch",
+                                method, target_url, snippet, delay, attempt + 1, max_retries
+                            );
+                            trigger_clash_switch(&state).await;
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            warn!(
+                                "Max retries ({}) reached for location-block 400. Forwarding to client.",
+                                max_retries
+                            );
+                        }
+                    } else {
+                        debug!(
+                            "Request {} {} returned non-retriable 400: {}",
+                            method, target_url, snippet
+                        );
+                    }
+                    // Forward the 400 to client if not retried
+                    let mut client_res_builder = Response::builder().status(status.as_u16());
+                    for (name, val) in upstream_res.headers() {
+                        if !is_hop_by_hop(name) {
+                            client_res_builder = client_res_builder.header(name, val);
+                        }
+                    }
+                    let body = if snippet.is_empty() {
+                        Body::empty()
+                    } else {
+                        Body::from(snippet)
+                    };
+                    return match client_res_builder.body(body) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            error!("Failed to build proxy response: {}", err);
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build proxy response: {}", err),
+                            )
+                                .into_response()
+                        }
+                    };
                 } else if status.is_success() {
                     if attempt > 0 {
                         info!(
@@ -251,8 +404,10 @@ pub async fn proxy_handler(
                         match chunk_res {
                             Ok(chunk) => {
                                 if let Some((in_stream_status, err_msg)) =
-                                    parse_in_stream_error(&chunk)
-                                        .filter(|(status, _)| is_retriable_status(*status))
+                                    parse_in_stream_error(&chunk).filter(|(status, msg)| {
+                                        is_retriable_status(*status)
+                                            || is_location_block_error(*status, msg)
+                                    })
                                 {
                                     in_stream_err_details =
                                         Some((chunk_index, in_stream_status, err_msg));
@@ -291,6 +446,7 @@ pub async fn proxy_handler(
                                 max_retries
                             );
 
+                            trigger_clash_switch(&state).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -321,6 +477,7 @@ pub async fn proxy_handler(
                                 max_retries
                             );
 
+                            trigger_clash_switch(&state).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -365,8 +522,10 @@ pub async fn proxy_handler(
                 match stream.next().await {
                     Some(Ok(first_chunk)) => {
                         if let Some((in_stream_status, err_msg)) =
-                            parse_in_stream_error(&first_chunk)
-                                .filter(|(status, _)| is_retriable_status(*status))
+                            parse_in_stream_error(&first_chunk).filter(|(status, msg)| {
+                                is_retriable_status(*status)
+                                    || is_location_block_error(*status, msg)
+                            })
                         {
                             if attempt < max_retries {
                                 let delay = calculate_backoff(
@@ -388,6 +547,7 @@ pub async fn proxy_handler(
                                     max_retries
                                 );
 
+                                trigger_clash_switch(&state).await;
                                 tokio::time::sleep(delay).await;
                                 attempt += 1;
                                 continue;
@@ -439,6 +599,7 @@ pub async fn proxy_handler(
                                 max_retries
                             );
 
+                            trigger_clash_switch(&state).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -482,6 +643,7 @@ pub async fn proxy_handler(
                         max_retries
                     );
 
+                    trigger_clash_switch(&state).await;
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;

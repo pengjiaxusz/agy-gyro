@@ -16,6 +16,19 @@ pub fn is_retriable_status(status: StatusCode) -> bool {
     )
 }
 
+/// Human-readable check for location-block 400 that should also be retried via Clash switch.
+pub fn is_location_block_error(status: StatusCode, body_snippet: &str) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && (body_snippet.contains("User location is not supported")
+            || body_snippet.contains("FAILED_PRECONDITION")
+            || body_snippet.contains("is not supported for the API use"))
+}
+
+/// Combined check: normal retriable OR location-block 400.
+pub fn is_retriable_with_location(status: StatusCode, body_snippet: &str) -> bool {
+    is_retriable_status(status) || is_location_block_error(status, body_snippet)
+}
+
 /// Checks if a reqwest error is a transient network/connection error.
 pub fn is_retriable_error(err: &reqwest::Error) -> bool {
     !err.is_builder() && !err.is_redirect() && !err.is_status()
@@ -176,6 +189,14 @@ mod tests {
         assert!(!is_retriable_status(StatusCode::UNAUTHORIZED));
         assert!(!is_retriable_status(StatusCode::FORBIDDEN));
         assert!(!is_retriable_status(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn test_location_block_is_retriable() {
+        let snippet = "User location is not supported for the API use. FAILED_PRECONDITION";
+        assert!(is_location_block_error(StatusCode::BAD_REQUEST, snippet));
+        assert!(is_retriable_with_location(StatusCode::BAD_REQUEST, snippet));
+        assert!(!is_location_block_error(StatusCode::BAD_REQUEST, "other 400 error"));
     }
 
     #[test]

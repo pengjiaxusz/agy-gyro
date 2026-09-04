@@ -37,6 +37,11 @@ async fn spawn_test_proxy_full(
         no_buffer,
         request_timeout_secs: 10,
         redirect_model,
+        clash_api: "http://127.0.0.1:9097".to_string(),
+        clash_secret: "set-your-secret".to_string(),
+        clash_group: "台美新日".to_string(),
+        clash_parent: "GLOBAL".to_string(),
+        no_clash_switch: true,
     };
 
     let client = Client::builder()
@@ -611,6 +616,11 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             no_buffer: false,
             request_timeout_secs: 10,
             redirect_model: Vec::new(),
+            clash_api: "http://127.0.0.1:9097".to_string(),
+            clash_secret: "set-your-secret".to_string(),
+            clash_group: "台美新日".to_string(),
+            clash_parent: "GLOBAL".to_string(),
+            no_clash_switch: true,
         },
         agy_path: "sh".to_string(),
         log_file: None,

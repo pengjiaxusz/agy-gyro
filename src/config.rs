@@ -108,6 +108,26 @@ pub struct Config {
     /// Redirect model requests in format "FROM:TO" (e.g. "gemini-3.7-flash:gemini-3.8-flash")
     #[arg(long, env = "AGY_GYRO_REDIRECT_MODEL", value_delimiter = ',')]
     pub redirect_model: Vec<String>,
+
+    /// Clash API base URL for auto-switch on retry (e.g. http://127.0.0.1:9097)
+    #[arg(long, env = "AGY_GYRO_CLASH_API", default_value = "http://127.0.0.1:9097")]
+    pub clash_api: String,
+
+    /// Clash external-controller secret
+    #[arg(long, env = "AGY_GYRO_CLASH_SECRET", default_value = "set-your-secret")]
+    pub clash_secret: String,
+
+    /// Clash proxy group to rotate inside (e.g. 台美新日)
+    #[arg(long, env = "AGY_GYRO_CLASH_GROUP", default_value = "台美新日")]
+    pub clash_group: String,
+
+    /// Clash parent selector to ensure it points to clash_group (e.g. GLOBAL)
+    #[arg(long, env = "AGY_GYRO_CLASH_PARENT", default_value = "GLOBAL")]
+    pub clash_parent: String,
+
+    /// Disable Clash auto-switch on retry
+    #[arg(long, env = "AGY_GYRO_NO_CLASH_SWITCH", default_value_t = false)]
+    pub no_clash_switch: bool,
 }
 
 impl Config {
