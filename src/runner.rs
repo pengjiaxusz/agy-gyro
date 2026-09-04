@@ -12,28 +12,48 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 ///
 /// In wrapper mode, to enforce the strict Zero-TTY Output Rule:
 /// - If `log_file` is provided, logs are written exclusively to that file.
-/// - If `log_file` is `None`, logs are directed to `std::io::sink()` (completely silenced).
+/// - If `log_file` is `None`, logs are written to a default file at
+///   `%TEMP%/agy-gyro.log` (Windows) or `$TMPDIR/agy-gyro.log` (Unix),
+///   i.e. `std::env::temp_dir().join("agy-gyro.log")`.
 pub fn init_wrapper_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agy_gyro=debug"));
 
-    if let Some(path) = log_file {
+    let resolved_path: Option<std::path::PathBuf> = match log_file {
+        Some(p) => Some(p.to_path_buf()),
+        None => Some(std::env::temp_dir().join("agy-gyro.log")),
+    };
+
+    if let Some(path) = resolved_path {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(file)
-                    .with_ansi(false),
-            )
-            .try_init();
+        // Best-effort: if default path fails (e.g. permission), fall back to sink instead of crashing wrapper
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => {
+                let _ = tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_writer(file)
+                            .with_ansi(false),
+                    )
+                    .try_init();
+                // Hint log location on stderr without breaking Zero-TTY stream (one line to aid debugging)
+                eprintln!("agy-gyro: logging to {}", path.display());
+            }
+            Err(e) => {
+                eprintln!("agy-gyro: failed to open log file {}: {} (logging silenced)", path.display(), e);
+                let _ = tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_writer(std::io::sink)
+                            .with_ansi(false),
+                    )
+                    .try_init();
+            }
+        }
     } else {
         let _ = tracing_subscriber::registry()
             .with(env_filter)
@@ -65,7 +85,7 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
 
     let client = build_http_client(&config)?;
     let state = Arc::new(ProxyState::new(config, client));
-    let app = create_router(state);
+    let app = create_router(Arc::clone(&state));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -82,6 +102,8 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
     let mut cmd = tokio::process::Command::new(&wrapper_args.agy_path);
     cmd.args(&wrapper_args.agy_args)
         .env("GOOGLE_GEMINI_BASE_URL", &proxy_url)
+        .env("CLOUD_CODE_URL", &proxy_url)
+        .env("GOOGLE_CLOUD_CODE_URL", &proxy_url)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
@@ -115,7 +137,7 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
         res = child.wait() => {
             res?
         }
-        sig = async {
+        _sig = async {
             #[cfg(unix)]
             tokio::select! {
                 _ = sigterm.recv() => libc::SIGTERM,
@@ -129,15 +151,15 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
             #[cfg(not(any(unix, windows)))]
             std::future::pending::<i32>().await
         } => {
+            #[cfg(unix)]
             if let Some(pid) = child.id() {
-                #[cfg(unix)]
                 unsafe {
-                    libc::kill(pid as libc::pid_t, sig);
+                    libc::kill(pid as libc::pid_t, _sig);
                 }
-                #[cfg(windows)]
-                {
-                    let _ = child.kill().await;
-                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = child.kill().await;
             }
 
             match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
@@ -152,6 +174,7 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
 
     let _ = shutdown_tx.send(());
     let _ = server_handle.await;
+    state.stats_manager.flush();
 
     let exit_code = exit_status.code().unwrap_or_else(|| {
         #[cfg(unix)]

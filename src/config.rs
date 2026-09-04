@@ -24,6 +24,22 @@ pub enum Commands {
     Server(ServerArgs),
     /// Run agy CLI wrapped with the local proxy (default mode)
     Run(WrapperArgs),
+    /// Show node reliability priority rankings and statistics
+    Stats(StatsArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct StatsArgs {
+    #[command(flatten)]
+    pub config: Config,
+
+    /// Specific hour (0-23) to inspect (default: current local hour)
+    #[arg(long)]
+    pub hour: Option<u8>,
+
+    /// Show detailed rankings for all 24 hours
+    #[arg(long, default_value_t = false)]
+    pub all_hours: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -81,16 +97,24 @@ pub struct Config {
     )]
     pub upstream: String,
 
-    /// Maximum retry attempts on retriable errors
-    #[arg(long, env = "AGY_GYRO_MAX_RETRIES", default_value_t = 15)]
+    /// Upstream Cloud Code API base URL (for Antigravity OAuth mode)
+    #[arg(
+        long,
+        env = "AGY_GYRO_CLOUDCODE_URL",
+        default_value = "https://daily-cloudcode-pa.googleapis.com"
+    )]
+    pub cloudcode_upstream: String,
+
+    /// Maximum retry attempts on retriable errors (0 = unlimited)
+    #[arg(long, env = "AGY_GYRO_MAX_RETRIES", default_value_t = 10000)]
     pub max_retries: u32,
 
     /// Initial retry backoff delay in milliseconds
-    #[arg(long, env = "AGY_GYRO_INITIAL_DELAY_MS", default_value_t = 1000)]
+    #[arg(long, env = "AGY_GYRO_INITIAL_DELAY_MS", default_value_t = 200)]
     pub initial_delay_ms: u64,
 
     /// Maximum retry backoff delay in milliseconds
-    #[arg(long, env = "AGY_GYRO_MAX_DELAY_MS", default_value_t = 60000)]
+    #[arg(long, env = "AGY_GYRO_MAX_DELAY_MS", default_value_t = 3000)]
     pub max_delay_ms: u64,
 
     /// Disable jitter in exponential backoff calculation
@@ -132,6 +156,26 @@ pub struct Config {
     /// Retry on all non-2xx responses (including 400/401/403) with Clash switch. By default only 429/5xx/408 and location-block 400 are retried.
     #[arg(long, env = "AGY_GYRO_RETRY_ALL", default_value_t = false)]
     pub retry_all: bool,
+
+    /// Optional path to node reliability statistics file (defaults to ~/.gemini/antigravity-cli/gyro-stats.json)
+    #[arg(long, env = "AGY_GYRO_STATS_FILE")]
+    pub stats_file: Option<PathBuf>,
+
+    /// Disable node reliability statistics and priority-based switching
+    #[arg(long, env = "AGY_GYRO_NO_STATS", default_value_t = false)]
+    pub no_stats: bool,
+
+    /// Maximum effective sample capacity per bucket
+    #[arg(long, env = "AGY_GYRO_STATS_MAX_SAMPLES", default_value_t = 20.0)]
+    pub stats_max_samples: f64,
+
+    /// Exponential half-life in days for time decay
+    #[arg(long, env = "AGY_GYRO_STATS_HALF_LIFE_DAYS", default_value_t = 7.0)]
+    pub stats_half_life_days: f64,
+
+    /// Burst window in seconds to damp rapid-fire consecutive requests
+    #[arg(long, env = "AGY_GYRO_STATS_BURST_WINDOW_SECS", default_value_t = 15)]
+    pub stats_burst_window_secs: i64,
 }
 
 impl Config {
@@ -148,5 +192,15 @@ impl Config {
             .iter()
             .filter_map(|s| s.split_once(':'))
             .collect()
+    }
+
+    pub fn resolved_stats_file(&self) -> PathBuf {
+        self.stats_file
+            .clone()
+            .unwrap_or_else(crate::stats::resolve_default_stats_path)
+    }
+
+    pub fn stats_half_life_secs(&self) -> f64 {
+        self.stats_half_life_days * 86400.0
     }
 }

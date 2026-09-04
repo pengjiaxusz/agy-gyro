@@ -6,6 +6,7 @@ use crate::retry::{
     is_retriable_aggressive, is_retriable_error, is_retriable_in_stream_with_flag,
     is_retriable_status, parse_in_stream_error, parse_retry_after,
 };
+use crate::stats::StatsManager;
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -23,16 +24,96 @@ pub struct ProxyState {
     pub config: Config,
     pub client: reqwest::Client,
     pub upstream_base: String,
+    pub cloudcode_base: String,
+    pub stats_manager: Arc<StatsManager>,
+    pub active_clash_node: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
 impl ProxyState {
     pub fn new(config: Config, client: reqwest::Client) -> Self {
         let upstream_base = config.upstream.trim_end_matches('/').to_string();
+        let cloudcode_base = config
+            .cloudcode_upstream
+            .trim_end_matches('/')
+            .to_string();
+        let stats_manager = StatsManager::new(
+            if config.no_stats {
+                None
+            } else {
+                Some(config.resolved_stats_file())
+            },
+            !config.no_stats,
+            config.stats_max_samples,
+            config.stats_half_life_secs(),
+            config.stats_burst_window_secs,
+        );
+        let active_clash_node = Arc::new(tokio::sync::RwLock::new(None));
+
         Self {
             config,
             client,
             upstream_base,
+            cloudcode_base,
+            stats_manager,
+            active_clash_node,
         }
+    }
+
+    /// Select upstream based on path: Cloud Code API (v1internal) vs Gemini API
+    pub fn select_upstream(&self, effective_path: &str) -> &str {
+        if effective_path.contains("v1internal") {
+            &self.cloudcode_base
+        } else {
+            &self.upstream_base
+        }
+    }
+
+    /// Gets cached active Clash node or fetches it from Clash API
+    pub async fn get_or_fetch_active_node(&self) -> String {
+        {
+            let guard = self.active_clash_node.read().await;
+            if let Some(ref node) = *guard {
+                if !node.is_empty() {
+                    return node.clone();
+                }
+            }
+        }
+        let node = self.fetch_current_clash_node().await;
+        if !node.is_empty() {
+            let mut guard = self.active_clash_node.write().await;
+            *guard = Some(node.clone());
+        }
+        node
+    }
+
+    /// Fetches the current node from Clash API
+    pub async fn fetch_current_clash_node(&self) -> String {
+        if self.config.no_clash_switch {
+            return String::new();
+        }
+        let api = self.config.clash_api.trim_end_matches('/');
+        let secret = &self.config.clash_secret;
+        let group = &self.config.clash_group;
+        let client = match reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return String::new(),
+        };
+        let mut req = client.get(format!("{}/proxies/{}", api, group));
+        if !secret.is_empty() {
+            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", secret));
+        }
+        if let Ok(resp) = req.send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(now) = json.get("now").and_then(|v| v.as_str()) {
+                    return now.to_string();
+                }
+            }
+        }
+        String::new()
     }
 }
 
@@ -48,9 +129,12 @@ pub fn build_http_client(config: &Config) -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-async fn trigger_clash_switch(state: &Arc<ProxyState>) {
+async fn trigger_clash_priority_switch(
+    state: &Arc<ProxyState>,
+    excluded_nodes: &[String],
+) -> Option<String> {
     if state.config.no_clash_switch {
-        return;
+        return None;
     }
     let api = state.config.clash_api.trim_end_matches('/');
     let secret = state.config.clash_secret.clone();
@@ -61,7 +145,7 @@ async fn trigger_clash_switch(state: &Arc<ProxyState>) {
         Ok(c) => c,
         Err(e) => {
             error!("Clash switch: failed to build client: {} (check AGY_GYRO_CLASH_API)", e);
-            return;
+            return None;
         }
     };
     let auth = if secret.is_empty() {
@@ -79,99 +163,128 @@ async fn trigger_clash_switch(state: &Arc<ProxyState>) {
         }
     }
     // Best-effort: switch parent with verification
-    match client.get(&parent_url).headers(headers.clone()).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("");
-                    if now != group {
-                        let res = client
-                            .put(&parent_url)
-                            .headers(headers.clone())
-                            .json(&serde_json::json!({"name": group}))
-                            .send()
-                            .await;
-                        match res {
-                            Ok(r) if r.status().is_success() => {
-                                info!("Clash switch: {}: {} -> {}", parent, now, group)
-                            }
-                            Ok(r) => {
-                                let status = r.status();
-                                let body = r.text().await.unwrap_or_default();
-                                error!("Clash switch parent failed: {} {} (api={}, parent={})", status, body, api, parent)
-                            },
-                            Err(e) => error!("Clash switch parent error: {} (api={}, parent={})", e, api, parent),
-                        }
-                    } else {
-                        debug!("Clash parent {} already at {}", parent, group);
-                    }
-                }
-                Err(e) => warn!("Clash get parent json parse failed: {} (api={})", e, api),
-            }
-        }
-        Ok(r) => {
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            error!("Clash get parent failed: {} {} (api={}, parent={})", status, body, api, parent)
-        },
-        Err(e) => error!("Clash get parent error: {} (api={}, parent={} - check Clash running?)", e, api, parent),
-    }
-    // 2. Rotate inside group with verification
-    match client.get(&group_url).headers(headers.clone()).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    let all = json.get("all").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                    let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let all_str: Vec<String> = all.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-                    if all_str.is_empty() {
-                        error!("Clash switch: group {} has no nodes (api={})", group, api);
-                        return;
-                    }
-                    let idx = all_str.iter().position(|n| n == &now).map(|i| (i + 1) % all_str.len()).unwrap_or(0);
-                    let nxt = &all_str[idx];
-                    if nxt == &now && all_str.len() == 1 {
-                        info!("Clash switch: {} only one node {}, staying", group, now);
-                        return;
-                    }
-                    // If now not found, nxt is first node - still switch
-                    let res = client
-                        .put(&group_url)
-                        .headers(headers)
-                        .json(&serde_json::json!({"name": nxt}))
+    if let Ok(resp) = client.get(&parent_url).headers(headers.clone()).send().await {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("");
+                if now != group {
+                    let _ = client
+                        .put(&parent_url)
+                        .headers(headers.clone())
+                        .json(&serde_json::json!({"name": group}))
                         .send()
                         .await;
-                    match res {
-                        Ok(r) if r.status().is_success() => {
-                            info!("Clash switch: {}: {} -> {}", group, now, nxt);
-                            // Verify switch
-                            tokio::time::sleep(Duration::from_millis(150)).await;
-                            if let Ok(verify) = client.get(&group_url).send().await {
-                                if let Ok(vjson) = verify.json::<serde_json::Value>().await {
-                                    let verified = vjson.get("now").and_then(|v| v.as_str()).unwrap_or("");
-                                    if verified != nxt {
-                                        warn!("Clash switch verify failed: expected {} but got {}", nxt, verified);
-                                    }
-                                }
-                            }
-                        },
-                        Ok(r) => {
-                            let status = r.status();
-                            let body = r.text().await.unwrap_or_default();
-                            error!("Clash switch group failed: {} {} (group={}, api={})", status, body, group, api)
-                        },
-                        Err(e) => error!("Clash switch group error: {} (group={}, api={})", e, group, api),
+                    info!("Clash switch: {}: {} -> {}", parent, now, group);
+                } else {
+                    debug!("Clash parent {} already at {}", parent, group);
+                }
+            }
+        }
+    }
+
+    // 2. Query nodes in group
+    let group_resp = match client.get(&group_url).headers(headers.clone()).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            error!("Clash get group failed: {} (group={}, api={})", r.status(), group, api);
+            return None;
+        }
+        Err(e) => {
+            error!("Clash get group error: {} (group={}, api={} - check Clash running?)", e, group, api);
+            return None;
+        }
+    };
+
+    let group_json = match group_resp.json::<serde_json::Value>().await {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Clash get group json parse failed: {} (api={})", e, api);
+            return None;
+        }
+    };
+
+    let all = group_json.get("all").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let now = group_json.get("now").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let all_str: Vec<String> = all.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+    if all_str.is_empty() {
+        error!("Clash switch: group {} has no nodes (api={})", group, api);
+        return None;
+    }
+
+    let hour = StatsManager::current_hour();
+
+    // 3. Select next node: priority-based if stats enabled, else legacy round-robin
+    let nxt = if state.stats_manager.is_enabled() {
+        let mut combined_excluded = excluded_nodes.to_vec();
+        if !now.is_empty() && !combined_excluded.contains(&now) {
+            combined_excluded.push(now.clone());
+        }
+        state
+            .stats_manager
+            .select_best_node(hour, &all_str, &combined_excluded)
+            .unwrap_or_else(|| all_str[0].clone())
+    } else {
+        let idx = all_str.iter().position(|n| n == &now).map(|i| (i + 1) % all_str.len()).unwrap_or(0);
+        all_str[idx].clone()
+    };
+
+    if nxt == now && all_str.len() == 1 {
+        info!("Clash switch: {} only one node {}, staying", group, now);
+        return Some(now);
+    }
+
+    let res = client
+        .put(&group_url)
+        .headers(headers.clone())
+        .json(&serde_json::json!({"name": nxt}))
+        .send()
+        .await;
+
+    match res {
+        Ok(r) if r.status().is_success() => {
+            // Update cached active node
+            {
+                let mut guard = state.active_clash_node.write().await;
+                *guard = Some(nxt.clone());
+            }
+
+            if state.stats_manager.is_enabled() {
+                let ranked = state.stats_manager.rank_nodes(hour, &all_str);
+                let score = ranked
+                    .iter()
+                    .find(|(n, _, _, _)| n == &nxt)
+                    .map(|(_, s, _, _)| *s)
+                    .unwrap_or(0.5);
+                info!(
+                    "Clash priority switch: {}: [{}] -> [{}] (hour {} reliability: {:.1}%)",
+                    group, now, nxt, hour, score * 100.0
+                );
+            } else {
+                info!("Clash switch: {}: {} -> {}", group, now, nxt);
+            }
+
+            // Verify switch fast (40ms, with auth)
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            if let Ok(verify) = client.get(&group_url).headers(headers.clone()).send().await {
+                if let Ok(vjson) = verify.json::<serde_json::Value>().await {
+                    let verified = vjson.get("now").and_then(|v| v.as_str()).unwrap_or("");
+                    if verified != nxt {
+                        warn!("Clash switch verify failed: expected {} but got {}", nxt, verified);
                     }
                 }
-                Err(e) => warn!("Clash get group json parse failed: {} (api={})", e, api),
             }
+            Some(nxt)
         }
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
-            error!("Clash get group failed: {} {} (group={}, api={})", status, body, group, api)
-        },
-        Err(e) => error!("Clash get group error: {} (group={}, api={} - check Clash running?)", e, group, api),
+            error!("Clash switch group failed: {} {} (group={}, api={})", status, body, group, api);
+            None
+        }
+        Err(e) => {
+            error!("Clash switch group error: {} (group={}, api={})", e, group, api);
+            None
+        }
     }
 }
 
@@ -181,6 +294,40 @@ pub fn create_router(state: Arc<ProxyState>) -> Router {
         .route("/{*path}", any(proxy_handler))
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
+}
+
+#[inline]
+fn is_generation_path(path: &str) -> bool {
+    path.contains("streamGenerateContent")
+        || path.contains("generateContent")
+        || path.contains("countTokens")
+        || path.contains("embedContent")
+}
+
+#[inline]
+fn should_switch_for_attempt(attempt: u32) -> bool {
+    // 3 tries per node: switch on attempt 2,5,8... (0-indexed)
+    attempt % 3 == 2
+}
+
+async fn handle_failure_and_switch(
+    state: &Arc<ProxyState>,
+    active_node: &mut String,
+    tried_nodes: &mut Vec<String>,
+    do_switch: bool,
+) {
+    let hour = StatsManager::current_hour();
+    if !active_node.is_empty() {
+        state.stats_manager.record_failure(active_node, hour);
+    }
+    if do_switch {
+        if let Some(new_node) = trigger_clash_priority_switch(state, tried_nodes).await {
+            *active_node = new_node.clone();
+            if !tried_nodes.contains(&new_node) {
+                tried_nodes.push(new_node);
+            }
+        }
+    }
 }
 
 fn is_hop_by_hop(header_name: &HeaderName) -> bool {
@@ -196,7 +343,6 @@ fn is_hop_by_hop(header_name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "content-length"
-            | "content-encoding"
     )
 }
 
@@ -252,7 +398,9 @@ pub async fn proxy_handler(
         raw_path_and_query.to_string()
     };
 
-    let target_url_str = format!("{}{}", state.upstream_base, effective_path);
+    // Select upstream: Gemini vs Cloud Code (Antigravity OAuth)
+    let upstream_base = state.select_upstream(&effective_path);
+    let target_url_str = format!("{}{}", upstream_base, effective_path);
     let target_url = match reqwest::Url::parse(&target_url_str) {
         Ok(url) => url,
         Err(err) => {
@@ -270,10 +418,26 @@ pub async fn proxy_handler(
     let with_jitter = state.config.is_jitter_enabled();
     let max_retries = state.config.max_retries;
 
+    // Entry log at INFO: one line per incoming client request (before forwarding)
+    info!(
+        "REQ {} {} -> {} body={}B redirects={:?}",
+        method,
+        raw_path_and_query,
+        target_url,
+        body.len(),
+        redirects
+    );
+
+    let mut tried_nodes: Vec<String> = Vec::new();
+    let mut active_node = state.get_or_fetch_active_node().await;
+    if !active_node.is_empty() {
+        tried_nodes.push(active_node.clone());
+    }
+
     let mut attempt = 0;
 
     loop {
-        debug!(
+        info!(
             "Forwarding request {} {} (attempt {}/{})",
             method, target_url, attempt, max_retries
         );
@@ -295,7 +459,7 @@ pub async fn proxy_handler(
                 let status = upstream_res.status();
 
                 if is_retriable_status(status) {
-                    if attempt < max_retries {
+                    if max_retries == 0 || attempt < max_retries {
                         let retry_after_duration = upstream_res
                             .headers()
                             .get(reqwest::header::RETRY_AFTER)
@@ -319,18 +483,20 @@ pub async fn proxy_handler(
                             }
                         }
 
+                        let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
                         warn!(
-                            "Upstream returned retriable status {} for {} {}. Retrying in {:?} (attempt {}/{}). Response: {}",
+                            "Upstream returned retriable status {} for {} {}. Retrying in {:?} (attempt {}/{}, switch={}) . Response: {}",
                             status,
                             method,
                             target_url,
                             delay,
                             attempt + 1,
                             max_retries,
+                            do_switch,
                             snippet
                         );
 
-                        trigger_clash_switch(&state).await;
+                        handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;
@@ -350,8 +516,10 @@ pub async fn proxy_handler(
                             snippet.push_str("...");
                         }
                     }
-                    if is_location_block_error(status, &snippet) {
-                        if attempt < max_retries {
+                    let is_loc = is_location_block_error(status, &snippet);
+                    let is_aggressive = state.config.retry_all && is_retriable_aggressive(status, &snippet);
+                    if is_loc || is_aggressive {
+                        if max_retries == 0 || attempt < max_retries {
                             let delay = calculate_backoff(
                                 attempt,
                                 initial_delay,
@@ -359,22 +527,25 @@ pub async fn proxy_handler(
                                 with_jitter,
                                 None,
                             );
+                            let kind = if is_loc { "location-block" } else { "aggressive" };
+                            // Switch immediately on attempt 0 for location block since retrying on same node is futile
+                            let do_switch = is_generation_path(&effective_path) && (is_loc || should_switch_for_attempt(attempt));
                             warn!(
-                                "Upstream returned location-block 400 for {} {}. Snippet: {}. Retrying in {:?} (attempt {}/{}) with Clash switch",
-                                method, target_url, snippet, delay, attempt + 1, max_retries
+                                "Upstream returned {} 400 for {} {}. Snippet: {}. Retrying in {:?} (attempt {}/{}, switch={}, retry_all={})",
+                                kind, method, target_url, snippet, delay, attempt + 1, max_retries, do_switch, state.config.retry_all
                             );
-                            trigger_clash_switch(&state).await;
+                            handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         } else {
                             warn!(
-                                "Max retries ({}) reached for location-block 400. Forwarding to client.",
-                                max_retries
+                                "Max retries ({}) reached for {} 400. Forwarding to client. Snippet: {}",
+                                max_retries, if is_loc { "location-block" } else { "aggressive" }, snippet
                             );
                         }
                     } else {
-                        debug!(
+                        info!(
                             "Request {} {} returned non-retriable 400: {}",
                             method, target_url, snippet
                         );
@@ -415,7 +586,7 @@ pub async fn proxy_handler(
                     // is_retriable_aggressive already covers 4xx/5xx + location-block; for retry_all we retry all non-2xx
                     let is_aggressive_retriable = is_retriable_aggressive(status, &snippet);
                     if is_aggressive_retriable {
-                        if attempt < max_retries {
+                        if max_retries == 0 || attempt < max_retries {
                             let delay = calculate_backoff(
                                 attempt,
                                 initial_delay,
@@ -423,11 +594,12 @@ pub async fn proxy_handler(
                                 with_jitter,
                                 None,
                             );
+                            let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
                             warn!(
-                                "Upstream returned aggressive-retriable status {} for {} {}. Snippet: {}. Retrying in {:?} (attempt {}/{}) with Clash switch",
-                                status, method, target_url, snippet, delay, attempt + 1, max_retries
+                                "Upstream returned aggressive-retriable status {} for {} {}. Snippet: {}. Retrying in {:?} (attempt {}/{}, switch={}) with Clash switch",
+                                status, method, target_url, snippet, delay, attempt + 1, max_retries, do_switch
                             );
-                            trigger_clash_switch(&state).await;
+                            handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -473,15 +645,15 @@ pub async fn proxy_handler(
                             method, target_url, attempt, status
                         );
                     } else {
-                        debug!(
+                        info!(
                             "Request {} {} succeeded (status {})",
                             method, target_url, status
                         );
                     }
                 } else {
-                    debug!(
-                        "Request {} {} returned non-retriable status {}",
-                        method, target_url, status
+                    info!(
+                        "Request {} {} returned non-retriable status {} (retry_all={})",
+                        method, target_url, status, state.config.retry_all
                     );
                 }
 
@@ -530,7 +702,7 @@ pub async fn proxy_handler(
                     }
 
                     if let Some((chunk_idx, in_stream_status, err_msg)) = in_stream_err_details {
-                        if attempt < max_retries {
+                        if max_retries == 0 || attempt < max_retries {
                             let delay = calculate_backoff(
                                 attempt,
                                 initial_delay,
@@ -551,7 +723,8 @@ pub async fn proxy_handler(
                                 max_retries
                             );
 
-                            trigger_clash_switch(&state).await;
+                            let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
+                            handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -562,7 +735,7 @@ pub async fn proxy_handler(
                             );
                         }
                     } else if let Some((chunk_idx, err)) = stream_error {
-                        if is_retriable_error(&err) && attempt < max_retries {
+                        if is_retriable_error(&err) && (max_retries == 0 || attempt < max_retries) {
                             let delay = calculate_backoff(
                                 attempt,
                                 initial_delay,
@@ -582,7 +755,8 @@ pub async fn proxy_handler(
                                 max_retries
                             );
 
-                            trigger_clash_switch(&state).await;
+                            let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
+                            handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -627,12 +801,12 @@ pub async fn proxy_handler(
                             };
                             if is_empty {
                                 // Only retry for model generation endpoints (avoid retrying unrelated 200 empty like /models list)
-                                let is_generation_path = effective_path.contains(":generateContent")
+                                let is_gen_path = effective_path.contains(":generateContent")
                                     || effective_path.contains(":streamGenerateContent")
                                     || effective_path.contains(":countTokens")
                                     || effective_path.contains(":embedContent");
-                                if is_generation_path {
-                                    if attempt < max_retries {
+                                if is_gen_path {
+                                    if max_retries == 0 || attempt < max_retries {
                                         let delay = calculate_backoff(
                                             attempt,
                                             initial_delay,
@@ -650,7 +824,8 @@ pub async fn proxy_handler(
                                             attempt + 1,
                                             max_retries
                                         );
-                                        trigger_clash_switch(&state).await;
+                                        let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
+                                        handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                                         tokio::time::sleep(delay).await;
                                         attempt += 1;
                                         continue;
@@ -668,6 +843,10 @@ pub async fn proxy_handler(
                     }
 
                     // All chunks buffered cleanly (or retries exhausted) - stream buffered chunks to client
+                    if status.is_success() && !active_node.is_empty() {
+                        state.stats_manager.record_success(&active_node, StatsManager::current_hour());
+                    }
+
                     let body_stream = futures_util::stream::iter(
                         buffered_chunks
                             .into_iter()
@@ -719,7 +898,7 @@ pub async fn proxy_handler(
                         };
                         if let Some((in_stream_status, err_msg)) = first_event_err
                         {
-                            if attempt < max_retries {
+                            if max_retries == 0 || attempt < max_retries {
                                 let delay = calculate_backoff(
                                     attempt,
                                     initial_delay,
@@ -739,7 +918,8 @@ pub async fn proxy_handler(
                                     max_retries
                                 );
 
-                                trigger_clash_switch(&state).await;
+                                let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
+                                handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                                 tokio::time::sleep(delay).await;
                                 attempt += 1;
                                 continue;
@@ -780,9 +960,9 @@ pub async fn proxy_handler(
                             }
                         };
                         if first_chunk_is_empty {
-                            let is_generation_path = effective_path.contains(":generateContent")
+                            let is_gen_path = effective_path.contains(":generateContent")
                                 || effective_path.contains(":streamGenerateContent");
-                            if is_generation_path && attempt < max_retries {
+                            if is_gen_path && (max_retries == 0 || attempt < max_retries) {
                                 let delay = calculate_backoff(
                                     attempt,
                                     initial_delay,
@@ -794,7 +974,8 @@ pub async fn proxy_handler(
                                     "Upstream returned empty candidate in first chunk for {} {}. Retrying in {:?} (attempt {}/{}) with Clash switch...",
                                     method, target_url, delay, attempt + 1, max_retries
                                 );
-                                trigger_clash_switch(&state).await;
+                                let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
+                                handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                                 tokio::time::sleep(delay).await;
                                 attempt += 1;
                                 continue;
@@ -802,6 +983,10 @@ pub async fn proxy_handler(
                         }
 
                         // Stream is healthy or retries exhausted: chain first chunk with remainder
+                        if status.is_success() && !active_node.is_empty() {
+                            state.stats_manager.record_success(&active_node, StatsManager::current_hour());
+                        }
+
                         let full_stream = futures_util::stream::once(async move {
                             Ok::<_, reqwest::Error>(first_chunk)
                         })
@@ -822,7 +1007,7 @@ pub async fn proxy_handler(
                         };
                     }
                     Some(Err(err)) => {
-                        if is_retriable_error(&err) && attempt < max_retries {
+                        if is_retriable_error(&err) && (max_retries == 0 || attempt < max_retries) {
                             let delay = calculate_backoff(
                                 attempt,
                                 initial_delay,
@@ -841,7 +1026,8 @@ pub async fn proxy_handler(
                                 max_retries
                             );
 
-                            trigger_clash_switch(&state).await;
+                            let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
+                            handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -859,9 +1045,9 @@ pub async fn proxy_handler(
                     }
                     None => {
                         // Empty response body - treat as retriable for generation endpoints (Gemini blank bug)
-                        let is_generation_path = effective_path.contains(":generateContent")
+                        let is_gen_path = effective_path.contains(":generateContent")
                             || effective_path.contains(":streamGenerateContent");
-                        if is_generation_path && attempt < max_retries {
+                        if is_gen_path && (max_retries == 0 || attempt < max_retries) {
                             let delay = calculate_backoff(
                                 attempt,
                                 initial_delay,
@@ -873,7 +1059,8 @@ pub async fn proxy_handler(
                                 "Upstream returned empty body (no chunks) for {} {}. Retrying in {:?} (attempt {}/{}) with Clash switch...",
                                 method, target_url, delay, attempt + 1, max_retries
                             );
-                            trigger_clash_switch(&state).await;
+                            let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
+                            handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -890,7 +1077,7 @@ pub async fn proxy_handler(
                 }
             }
             Err(err) => {
-                if is_retriable_error(&err) && attempt < max_retries {
+                if is_retriable_error(&err) && (max_retries == 0 || attempt < max_retries) {
                     let delay =
                         calculate_backoff(attempt, initial_delay, max_delay, with_jitter, None);
 
@@ -904,7 +1091,8 @@ pub async fn proxy_handler(
                         max_retries
                     );
 
-                    trigger_clash_switch(&state).await;
+                    let do_switch = is_generation_path(&effective_path) && should_switch_for_attempt(attempt);
+                    handle_failure_and_switch(&state, &mut active_node, &mut tried_nodes, do_switch).await;
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;
