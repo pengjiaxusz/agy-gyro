@@ -4,9 +4,9 @@ use chrono::Timelike;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
 pub const DEFAULT_PRIOR_ALPHA: f64 = 1.0; // Neutral prior successes (50% mean with beta=1)
 pub const DEFAULT_PRIOR_BETA: f64 = 1.0; // Prior failures
@@ -261,7 +261,6 @@ impl StatsManager {
                             if let Err(e) = Self::setup_database(&c) {
                                 error!("Failed to setup SQLite database at {}: {}", path.display(), e);
                             }
-                            Self::maybe_migrate_legacy_json(&c, path);
                             Some(c)
                         }
                         Err(e) => {
@@ -317,87 +316,6 @@ impl StatsManager {
         Ok(())
     }
 
-    fn maybe_migrate_legacy_json(conn: &Connection, db_path: &Path) {
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM node_stats", [], |r| r.get(0))
-            .unwrap_or(0);
-        if count > 0 {
-            return;
-        }
-
-        let legacy_path = db_path.with_file_name("gyro-stats.json");
-        if legacy_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&legacy_path) {
-                if let Ok(legacy_file) = serde_json::from_str::<StatsFile>(&content) {
-                    if !legacy_file.nodes.is_empty() {
-                        let node_count = legacy_file.nodes.len();
-                        if let Err(e) = Self::import_stats_file(conn, &legacy_file) {
-                            warn!("Failed to migrate legacy stats JSON: {}", e);
-                        } else {
-                            info!(
-                                "Migrated {} nodes from legacy stats JSON ({}) to SQLite ({})",
-                                node_count,
-                                legacy_path.display(),
-                                db_path.display()
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn import_stats_file(conn: &Connection, stats: &StatsFile) -> rusqlite::Result<()> {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO meta (key, value) VALUES ('updated_at', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![stats.updated_at],
-        )?;
-
-        for (node, ns) in &stats.nodes {
-            tx.execute(
-                "INSERT INTO node_stats (node_name, hour, successes, failures, last_updated_sec, burst_count)
-                 VALUES (?1, -1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(node_name, hour) DO UPDATE SET
-                   successes = excluded.successes,
-                   failures = excluded.failures,
-                   last_updated_sec = excluded.last_updated_sec,
-                   burst_count = excluded.burst_count",
-                params![
-                    node,
-                    ns.overall.successes,
-                    ns.overall.failures,
-                    ns.overall.last_updated_sec,
-                    ns.overall.burst_count,
-                ],
-            )?;
-
-            for (h, hourly_c) in ns.hourly.iter().enumerate() {
-                if hourly_c.total() > 0.0 || hourly_c.last_updated_sec > 0 {
-                    tx.execute(
-                        "INSERT INTO node_stats (node_name, hour, successes, failures, last_updated_sec, burst_count)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                         ON CONFLICT(node_name, hour) DO UPDATE SET
-                           successes = excluded.successes,
-                           failures = excluded.failures,
-                           last_updated_sec = excluded.last_updated_sec,
-                           burst_count = excluded.burst_count",
-                        params![
-                            node,
-                            h as i32,
-                            hourly_c.successes,
-                            hourly_c.failures,
-                            hourly_c.last_updated_sec,
-                            hourly_c.burst_count,
-                        ],
-                    )?;
-                }
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
 
     #[inline]
     pub fn is_enabled(&self) -> bool {
@@ -946,7 +864,7 @@ mod tests {
     fn test_serialization_roundtrip() {
         let temp_dir = std::env::temp_dir().join(format!("gyro-test-{}", rand::random::<u32>()));
         let _ = std::fs::create_dir_all(&temp_dir);
-        let file_path = temp_dir.join("stats.json");
+        let file_path = temp_dir.join("stats.db");
 
         let manager = StatsManager::new(Some(file_path.clone()), true, 20.0, 7.0 * 86400.0, 15);
         manager.record_success("node-test", 10);
@@ -961,34 +879,6 @@ mod tests {
         assert!(node_stats.overall.failures > 0.0);
         assert!(node_stats.hourly[10].successes > 0.0);
         assert!(node_stats.hourly[10].failures > 0.0);
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_legacy_json_migration() {
-        let temp_dir = std::env::temp_dir().join(format!("gyro-migration-test-{}", rand::random::<u32>()));
-        let _ = std::fs::create_dir_all(&temp_dir);
-
-        let json_path = temp_dir.join("gyro-stats.json");
-        let mut legacy_stats = StatsFile::default();
-        let mut ns = NodeStats::default();
-        ns.overall.successes = 10.0;
-        ns.overall.failures = 2.0;
-        ns.hourly[14].successes = 5.0;
-        legacy_stats.nodes.insert("migrated-node".to_string(), ns);
-
-        let json_data = serde_json::to_string_pretty(&legacy_stats).unwrap();
-        std::fs::write(&json_path, json_data).unwrap();
-
-        let db_path = temp_dir.join("gyro.db");
-        let manager = StatsManager::new(Some(db_path), true, 20.0, 7.0 * 86400.0, 15);
-
-        let snap = manager.snapshot();
-        let node = snap.nodes.get("migrated-node").expect("migrated-node should exist in SQLite");
-        assert_eq!(node.overall.successes, 10.0);
-        assert_eq!(node.overall.failures, 2.0);
-        assert_eq!(node.hourly[14].successes, 5.0);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

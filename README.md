@@ -57,7 +57,7 @@ Rather than naive sequential round-robin, `agy-gyro` features a **scientific 24-
 - **Burst Damping**: Consecutive requests within a short time window (e.g., 15s) receive diminishing statistical weight ($\Delta S = \frac{1}{1 + 0.5 \times burst}$) to prevent a quick succession of requests from artificially inflating or deflating a node's reputation.
 - **Bayesian Shrinkage Scoring**: Uses Empirical Bayes shrinkage towards both the overall node average and a neutral 50% prior ($\alpha=1.0, \beta=1.0$), ensuring that a single failure never destroys a node's standing.
 - **Effective Sample Capacity Cap**: Clamps historical sample weight (default 20.0) so nodes can rapidly recover or adapt when conditions change.
-- **Multi-Process SQLite Persistence**: Automatically stored in SQLite database (`~/.gemini/antigravity-cli/gyro.db` or `%USERPROFILE%\.gemini\antigravity-cli\gyro.db` on Windows) with WAL mode, ensuring zero data loss, real-time transaction durability, and multi-process concurrency across multiple terminals. Legacy `gyro-stats.json` files are automatically migrated.
+- **Multi-Process SQLite Persistence**: Automatically stored in SQLite database (`~/.gemini/antigravity-cli/gyro.db` or `%USERPROFILE%\.gemini\antigravity-cli\gyro.db` on Windows) with WAL mode, ensuring zero data loss, real-time transaction durability, and multi-process concurrency across multiple terminals.
 
 ## Installation
 
