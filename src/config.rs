@@ -157,7 +157,7 @@ pub struct Config {
     #[arg(long, env = "AGY_GYRO_RETRY_ALL", default_value_t = false)]
     pub retry_all: bool,
 
-    /// Optional path to node reliability statistics file (defaults to ~/.gemini/antigravity-cli/gyro-stats.json)
+    /// Optional path to node reliability statistics file (defaults to ~/.gemini/antigravity-cli/gyro.db)
     #[arg(long, env = "AGY_GYRO_STATS_FILE")]
     pub stats_file: Option<PathBuf>,
 

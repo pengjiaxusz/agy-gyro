@@ -1050,12 +1050,12 @@ async fn test_stats_path_resolution_targets_gemini_folder() {
     let path = agy_gyro::stats::resolve_default_stats_path();
     let path_str = path.to_string_lossy();
     assert!(
-        path_str.ends_with("gyro-stats.json"),
-        "Path should end with gyro-stats.json: {}",
+        path_str.ends_with("gyro.db"),
+        "Path should end with gyro.db: {}",
         path_str
     );
     assert!(
-        path_str.contains(".gemini") || path_str.contains(".agy-gyro") || path_str.contains("gyro-stats"),
+        path_str.contains(".gemini") || path_str.contains(".agy-gyro") || path_str.contains("gyro.db"),
         "Path should be inside user gemini or agy folder: {}",
         path_str
     );
@@ -1193,6 +1193,131 @@ async fn test_priority_clash_switch_selects_highest_score_node() {
     assert!(failing_stats.overall.failures > 0.0);
 
     let _ = std::fs::remove_dir_all(&temp_stats_dir);
+}
+
+#[test]
+fn test_sole_instance_truncates_log_and_concurrent_instance_appends() {
+    use std::io::Write;
+    let temp_dir = std::env::temp_dir().join(format!("gyro-log-test-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let log_path = temp_dir.join("test.log");
+
+    // Pre-populate old log content
+    std::fs::write(&log_path, "old historical log content from yesterday\n").unwrap();
+
+    // 1. Instance 1 starts: it is the sole instance -> should TRUNCATE
+    let (mut log_file_1, lock_1, is_sole_1) =
+        agy_gyro::runner::open_log_file_internal(&log_path).unwrap();
+    assert!(is_sole_1, "First instance must be sole instance");
+    writeln!(log_file_1, "instance 1 first line").unwrap();
+    drop(log_file_1);
+
+    let content_after_1 = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !content_after_1.contains("old historical log content"),
+        "Historical log must be truncated by sole instance"
+    );
+    assert!(content_after_1.contains("instance 1 first line"));
+
+    // 2. Instance 2 starts while Instance 1's lock_1 is still held -> should APPEND
+    let (mut log_file_2, lock_2, is_sole_2) =
+        agy_gyro::runner::open_log_file_internal(&log_path).unwrap();
+    assert!(!is_sole_2, "Second instance while lock_1 held must not be sole instance");
+    writeln!(log_file_2, "instance 2 appended line").unwrap();
+    drop(log_file_2);
+
+    let content_after_2 = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        content_after_2.contains("instance 1 first line"),
+        "Instance 1 log must be preserved"
+    );
+    assert!(
+        content_after_2.contains("instance 2 appended line"),
+        "Instance 2 log must be appended"
+    );
+
+    // 3. Both instances exit: drop both locks
+    drop(lock_1);
+    drop(lock_2);
+
+    // 4. Instance 3 starts fresh -> should TRUNCATE again
+    let (mut log_file_3, _lock_3, is_sole_3) =
+        agy_gyro::runner::open_log_file_internal(&log_path).unwrap();
+    assert!(is_sole_3, "Instance starting with no active locks must be sole instance");
+    writeln!(log_file_3, "instance 3 brand new session").unwrap();
+    drop(log_file_3);
+
+    let content_after_3 = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !content_after_3.contains("instance 1"),
+        "Logs from previous session should be truncated"
+    );
+    assert!(
+        !content_after_3.contains("instance 2"),
+        "Logs from previous session should be truncated"
+    );
+    assert!(content_after_3.contains("instance 3 brand new session"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_sqlite_multi_instance_concurrent_writes() {
+    let temp_dir = std::env::temp_dir().join(format!("gyro-db-concurrency-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let db_path = temp_dir.join("gyro.db");
+
+    let manager_1 = agy_gyro::stats::StatsManager::new(
+        Some(db_path.clone()),
+        true,
+        20.0,
+        7.0 * 86400.0,
+        15,
+    );
+    let manager_2 = agy_gyro::stats::StatsManager::new(
+        Some(db_path.clone()),
+        true,
+        20.0,
+        7.0 * 86400.0,
+        15,
+    );
+
+    let hour = 15;
+    // Concurrently write from two different instances pointing to the same SQLite DB file
+    let m1 = manager_1.clone();
+    let m2 = manager_2.clone();
+
+    let t1 = std::thread::spawn(move || {
+        for _ in 0..10 {
+            m1.record_success("node-shared-a", hour);
+        }
+    });
+
+    let t2 = std::thread::spawn(move || {
+        for _ in 0..10 {
+            m2.record_success("node-shared-b", hour);
+        }
+    });
+
+    t1.join().unwrap();
+    t2.join().unwrap();
+
+    // Verify both managers and a third fresh manager see the exact shared data
+    let manager_3 = agy_gyro::stats::StatsManager::new(
+        Some(db_path),
+        true,
+        20.0,
+        7.0 * 86400.0,
+        15,
+    );
+    let snap = manager_3.snapshot();
+    let a = snap.nodes.get("node-shared-a").expect("node-shared-a should exist");
+    let b = snap.nodes.get("node-shared-b").expect("node-shared-b should exist");
+
+    assert!(a.overall.successes > 0.0);
+    assert!(b.overall.successes > 0.0);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 

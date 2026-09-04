@@ -2,11 +2,66 @@
 
 use crate::config::WrapperArgs;
 use crate::proxy::{ProxyState, build_http_client, create_router};
+use fs2::FileExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+static INSTANCE_LOCK: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// Internal helper for sole-instance detection and log file opening.
+/// Returns (log_file, lock_file_handle, is_sole_instance).
+pub fn open_log_file_internal(path: &Path) -> std::io::Result<(std::fs::File, std::fs::File, bool)> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let lock_path = path.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    let is_sole_instance = match lock_file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = lock_file.unlock();
+            let _ = lock_file.lock_shared();
+            true
+        }
+        Err(_) => {
+            let _ = lock_file.lock_shared();
+            false
+        }
+    };
+
+    let log_file = if is_sole_instance {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?
+    } else {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+    };
+
+    Ok((log_file, lock_file, is_sole_instance))
+}
+
+/// Opens the log file, automatically truncating it if no other agy-gyro instance is active.
+pub fn open_log_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let (log_file, lock_file, _) = open_log_file_internal(path)?;
+    if let Ok(mut guard) = INSTANCE_LOCK.lock() {
+        *guard = Some(lock_file);
+    }
+    Ok(log_file)
+}
 
 /// Initializes the tracing subscriber for wrapper mode.
 ///
@@ -15,6 +70,9 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// - If `log_file` is `None`, logs are written to a default file at
 ///   `%TEMP%/agy-gyro.log` (Windows) or `$TMPDIR/agy-gyro.log` (Unix),
 ///   i.e. `std::env::temp_dir().join("agy-gyro.log")`.
+///
+/// If no other instances of agy-gyro are currently running, the log file is truncated
+/// clean on startup to prevent unbounded disk growth.
 pub fn init_wrapper_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agy_gyro=debug"));
@@ -25,11 +83,8 @@ pub fn init_wrapper_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::
     };
 
     if let Some(path) = resolved_path {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         // Best-effort: if default path fails (e.g. permission), fall back to sink instead of crashing wrapper
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        match open_log_file(&path) {
             Ok(file) => {
                 let _ = tracing_subscriber::registry()
                     .with(env_filter)

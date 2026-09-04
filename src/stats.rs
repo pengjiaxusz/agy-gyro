@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 
 use chrono::Timelike;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 pub const DEFAULT_PRIOR_ALPHA: f64 = 1.0; // Neutral prior successes (50% mean with beta=1)
@@ -234,9 +234,8 @@ impl Default for StatsFile {
 }
 
 pub struct StatsManager {
-    data: RwLock<StatsFile>,
+    conn: Mutex<Option<Connection>>,
     file_path: Option<PathBuf>,
-    dirty: AtomicBool,
     enabled: bool,
     max_samples: f64,
     half_life_secs: f64,
@@ -251,32 +250,153 @@ impl StatsManager {
         half_life_secs: f64,
         burst_window_secs: i64,
     ) -> Arc<Self> {
-        let stats_file = if enabled {
-            if let Some(ref path) = file_path {
-                Self::load_from_disk(path).unwrap_or_else(|e| {
-                    warn!(
-                        "Failed to load stats from {}: {}. Initializing empty stats.",
-                        path.display(),
-                        e
-                    );
-                    StatsFile::default()
-                })
-            } else {
-                StatsFile::default()
+        let conn = if enabled {
+            match &file_path {
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match Connection::open(path) {
+                        Ok(c) => {
+                            if let Err(e) = Self::setup_database(&c) {
+                                error!("Failed to setup SQLite database at {}: {}", path.display(), e);
+                            }
+                            Self::maybe_migrate_legacy_json(&c, path);
+                            Some(c)
+                        }
+                        Err(e) => {
+                            error!("Failed to open SQLite database at {}: {}", path.display(), e);
+                            None
+                        }
+                    }
+                }
+                None => match Connection::open_in_memory() {
+                    Ok(c) => {
+                        let _ = Self::setup_database(&c);
+                        Some(c)
+                    }
+                    Err(e) => {
+                        error!("Failed to open in-memory SQLite database: {}", e);
+                        None
+                    }
+                },
             }
         } else {
-            StatsFile::default()
+            None
         };
 
         Arc::new(Self {
-            data: RwLock::new(stats_file),
+            conn: Mutex::new(conn),
             file_path,
-            dirty: AtomicBool::new(false),
             enabled,
             max_samples,
             half_life_secs,
             burst_window_secs,
         })
+    }
+
+    fn setup_database(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS node_stats (
+                 node_name TEXT NOT NULL,
+                 hour INTEGER NOT NULL,
+                 successes REAL NOT NULL DEFAULT 0.0,
+                 failures REAL NOT NULL DEFAULT 0.0,
+                 last_updated_sec INTEGER NOT NULL DEFAULT 0,
+                 burst_count INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (node_name, hour)
+             );"
+        )?;
+        Ok(())
+    }
+
+    fn maybe_migrate_legacy_json(conn: &Connection, db_path: &Path) {
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_stats", [], |r| r.get(0))
+            .unwrap_or(0);
+        if count > 0 {
+            return;
+        }
+
+        let legacy_path = db_path.with_file_name("gyro-stats.json");
+        if legacy_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&legacy_path) {
+                if let Ok(legacy_file) = serde_json::from_str::<StatsFile>(&content) {
+                    if !legacy_file.nodes.is_empty() {
+                        let node_count = legacy_file.nodes.len();
+                        if let Err(e) = Self::import_stats_file(conn, &legacy_file) {
+                            warn!("Failed to migrate legacy stats JSON: {}", e);
+                        } else {
+                            info!(
+                                "Migrated {} nodes from legacy stats JSON ({}) to SQLite ({})",
+                                node_count,
+                                legacy_path.display(),
+                                db_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn import_stats_file(conn: &Connection, stats: &StatsFile) -> rusqlite::Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('updated_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![stats.updated_at],
+        )?;
+
+        for (node, ns) in &stats.nodes {
+            tx.execute(
+                "INSERT INTO node_stats (node_name, hour, successes, failures, last_updated_sec, burst_count)
+                 VALUES (?1, -1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(node_name, hour) DO UPDATE SET
+                   successes = excluded.successes,
+                   failures = excluded.failures,
+                   last_updated_sec = excluded.last_updated_sec,
+                   burst_count = excluded.burst_count",
+                params![
+                    node,
+                    ns.overall.successes,
+                    ns.overall.failures,
+                    ns.overall.last_updated_sec,
+                    ns.overall.burst_count,
+                ],
+            )?;
+
+            for (h, hourly_c) in ns.hourly.iter().enumerate() {
+                if hourly_c.total() > 0.0 || hourly_c.last_updated_sec > 0 {
+                    tx.execute(
+                        "INSERT INTO node_stats (node_name, hour, successes, failures, last_updated_sec, burst_count)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                         ON CONFLICT(node_name, hour) DO UPDATE SET
+                           successes = excluded.successes,
+                           failures = excluded.failures,
+                           last_updated_sec = excluded.last_updated_sec,
+                           burst_count = excluded.burst_count",
+                        params![
+                            node,
+                            h as i32,
+                            hourly_c.successes,
+                            hourly_c.failures,
+                            hourly_c.last_updated_sec,
+                            hourly_c.burst_count,
+                        ],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     #[inline]
@@ -296,35 +416,121 @@ impl StatsManager {
         chrono::Utc::now().timestamp()
     }
 
+    fn fetch_counts(conn: &Connection, node: &str, hour: i32) -> rusqlite::Result<StatCounts> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT successes, failures, last_updated_sec, burst_count
+             FROM node_stats WHERE node_name = ?1 AND hour = ?2",
+        )?;
+        let mut rows = stmt.query(params![node, hour])?;
+        if let Some(row) = rows.next()? {
+            Ok(StatCounts {
+                successes: row.get(0)?,
+                failures: row.get(1)?,
+                last_updated_sec: row.get(2)?,
+                burst_count: row.get(3)?,
+            })
+        } else {
+            Ok(StatCounts::default())
+        }
+    }
+
+    fn save_counts(conn: &Connection, node: &str, hour: i32, counts: &StatCounts) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO node_stats (node_name, hour, successes, failures, last_updated_sec, burst_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(node_name, hour) DO UPDATE SET
+               successes = excluded.successes,
+               failures = excluded.failures,
+               last_updated_sec = excluded.last_updated_sec,
+               burst_count = excluded.burst_count",
+        )?;
+        stmt.execute(params![
+            node,
+            hour,
+            counts.successes,
+            counts.failures,
+            counts.last_updated_sec,
+            counts.burst_count,
+        ])?;
+        Ok(())
+    }
+
+    fn update_node_record(
+        conn: &Connection,
+        node: &str,
+        hour: i32,
+        now: i64,
+        half_life_secs: f64,
+        burst_window_secs: i64,
+        max_samples: f64,
+        is_success: bool,
+    ) -> rusqlite::Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        let mut overall = Self::fetch_counts(&tx, node, -1)?;
+        let mut hourly = Self::fetch_counts(&tx, node, hour)?;
+
+        if is_success {
+            overall.record_success(now, half_life_secs, burst_window_secs, max_samples);
+            hourly.record_success(now, half_life_secs, burst_window_secs, max_samples);
+        } else {
+            overall.record_failure(now, half_life_secs, max_samples);
+            hourly.record_failure(now, half_life_secs, max_samples);
+        }
+
+        Self::save_counts(&tx, node, -1, &overall)?;
+        Self::save_counts(&tx, node, hour, &hourly)?;
+
+        let now_str = chrono::Local::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('updated_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![now_str],
+        )?;
+
+        tx.commit()?;
+
+        debug!(
+            "Recorded {} for node [{}] in hour {}. (hourly: {:.2}/{:.2}, overall: {:.2}/{:.2})",
+            if is_success { "SUCCESS" } else { "FAILURE" },
+            node,
+            hour,
+            hourly.successes,
+            hourly.total(),
+            overall.successes,
+            overall.total()
+        );
+        Ok(())
+    }
+
     /// Records a success for the specified node in current local hour.
     pub fn record_success(&self, node: &str, hour: u8) {
         if !self.enabled || node.is_empty() {
             return;
         }
+        let guard = match self.conn.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let conn = match guard.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
         let now = Self::now_sec();
-        if let Ok(mut guard) = self.data.write() {
-            let (h_s, h_tot, o_s, o_tot) = {
-                let entry = guard.nodes.entry(node.to_string()).or_default();
-                entry.record_success(
-                    hour,
-                    now,
-                    self.half_life_secs,
-                    self.burst_window_secs,
-                    self.max_samples,
-                );
-                (
-                    entry.hourly[(hour as usize) % 24].successes,
-                    entry.hourly[(hour as usize) % 24].total(),
-                    entry.overall.successes,
-                    entry.overall.total(),
-                )
-            };
-            guard.updated_at = chrono::Local::now().to_rfc3339();
-            self.dirty.store(true, Ordering::Release);
-            debug!(
-                "Recorded SUCCESS for node [{}] in hour {}. (hourly: {:.2}/{:.2}, overall: {:.2}/{:.2})",
-                node, hour, h_s, h_tot, o_s, o_tot
-            );
+        let h = (hour as i32) % 24;
+
+        if let Err(e) = Self::update_node_record(
+            conn,
+            node,
+            h,
+            now,
+            self.half_life_secs,
+            self.burst_window_secs,
+            self.max_samples,
+            true,
+        ) {
+            error!("Failed to record success for node [{}] to SQLite: {}", node, e);
         }
     }
 
@@ -333,24 +539,29 @@ impl StatsManager {
         if !self.enabled || node.is_empty() {
             return;
         }
+        let guard = match self.conn.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let conn = match guard.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
         let now = Self::now_sec();
-        if let Ok(mut guard) = self.data.write() {
-            let (h_s, h_tot, o_s, o_tot) = {
-                let entry = guard.nodes.entry(node.to_string()).or_default();
-                entry.record_failure(hour, now, self.half_life_secs, self.max_samples);
-                (
-                    entry.hourly[(hour as usize) % 24].successes,
-                    entry.hourly[(hour as usize) % 24].total(),
-                    entry.overall.successes,
-                    entry.overall.total(),
-                )
-            };
-            guard.updated_at = chrono::Local::now().to_rfc3339();
-            self.dirty.store(true, Ordering::Release);
-            debug!(
-                "Recorded FAILURE for node [{}] in hour {}. (hourly: {:.2}/{:.2}, overall: {:.2}/{:.2})",
-                node, hour, h_s, h_tot, o_s, o_tot
-            );
+        let h = (hour as i32) % 24;
+
+        if let Err(e) = Self::update_node_record(
+            conn,
+            node,
+            h,
+            now,
+            self.half_life_secs,
+            self.burst_window_secs,
+            self.max_samples,
+            false,
+        ) {
+            error!("Failed to record failure for node [{}] to SQLite: {}", node, e);
         }
     }
 
@@ -365,29 +576,42 @@ impl StatsManager {
             return Vec::new();
         }
 
-        let now = Self::now_sec();
-        let guard = match self.data.read() {
+        let guard = match self.conn.lock() {
             Ok(g) => g,
             Err(_) => {
                 return candidates
                     .iter()
-                    .map(|c| {
-                        (
-                            c.clone(),
-                            0.5,
-                            StatCounts::default(),
-                            StatCounts::default(),
-                        )
-                    })
+                    .map(|c| (c.clone(), 0.5, StatCounts::default(), StatCounts::default()))
+                    .collect();
+            }
+        };
+        let conn = match guard.as_ref() {
+            Some(c) => c,
+            None => {
+                return candidates
+                    .iter()
+                    .map(|c| (c.clone(), 0.5, StatCounts::default(), StatCounts::default()))
                     .collect();
             }
         };
 
+        let now = Self::now_sec();
+        let h = (hour as i32) % 24;
+
         let mut ranked: Vec<(String, f64, StatCounts, StatCounts)> = candidates
             .iter()
             .map(|node| {
-                if let Some(stats) = guard.nodes.get(node) {
-                    let score = stats.calculate_score(
+                let overall = Self::fetch_counts(conn, node, -1).unwrap_or_default();
+                let hourly = Self::fetch_counts(conn, node, h).unwrap_or_default();
+
+                if overall.total() > 0.0 || hourly.total() > 0.0 {
+                    let mut node_stats = NodeStats {
+                        overall: overall.clone(),
+                        hourly: default_hourly(),
+                    };
+                    node_stats.hourly[h as usize] = hourly.clone();
+
+                    let score = node_stats.calculate_score(
                         hour,
                         now,
                         self.half_life_secs,
@@ -395,26 +619,23 @@ impl StatsManager {
                         DEFAULT_PRIOR_BETA,
                         DEFAULT_SHRINKAGE_WEIGHT,
                     );
-                    let (hs, hf) = stats.hourly[(hour as usize) % 24]
-                        .decayed_counts_at(now, self.half_life_secs);
-                    let (os, of) = stats.overall.decayed_counts_at(now, self.half_life_secs);
+                    let (hs, hf) = hourly.decayed_counts_at(now, self.half_life_secs);
+                    let (os, of) = overall.decayed_counts_at(now, self.half_life_secs);
                     let hourly_c = StatCounts {
                         successes: hs,
                         failures: hf,
-                        last_updated_sec: stats.hourly[(hour as usize) % 24].last_updated_sec,
-                        burst_count: stats.hourly[(hour as usize) % 24].burst_count,
+                        last_updated_sec: hourly.last_updated_sec,
+                        burst_count: hourly.burst_count,
                     };
                     let overall_c = StatCounts {
                         successes: os,
                         failures: of,
-                        last_updated_sec: stats.overall.last_updated_sec,
-                        burst_count: stats.overall.burst_count,
+                        last_updated_sec: overall.last_updated_sec,
+                        burst_count: overall.burst_count,
                     };
                     (node.clone(), score, hourly_c, overall_c)
                 } else {
-                    // New unobserved node: prior score
-                    let score =
-                        DEFAULT_PRIOR_ALPHA / (DEFAULT_PRIOR_ALPHA + DEFAULT_PRIOR_BETA);
+                    let score = DEFAULT_PRIOR_ALPHA / (DEFAULT_PRIOR_ALPHA + DEFAULT_PRIOR_BETA);
                     (
                         node.clone(),
                         score,
@@ -425,7 +646,6 @@ impl StatsManager {
             })
             .collect();
 
-        // Sort descending by score. Tie-break by node name for determinism.
         ranked.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -469,63 +689,87 @@ impl StatsManager {
         ranked.first().map(|(n, _, _, _)| n.clone())
     }
 
-    /// Flushes stats to disk if marked dirty.
+    /// Checkpoints SQLite WAL data. Retained for backward compatibility.
     pub fn flush(&self) {
         if !self.enabled {
             return;
         }
-        if !self.dirty.swap(false, Ordering::AcqRel) {
-            return;
-        }
-
-        if let Some(ref path) = self.file_path {
-            if let Ok(guard) = self.data.read() {
-                if let Err(e) = Self::write_to_disk(path, &guard) {
-                    error!("Failed to write stats to {}: {}", path.display(), e);
-                    self.dirty.store(true, Ordering::Release);
-                } else {
-                    info!(
-                        "Successfully persisted node reliability stats to {}",
-                        path.display()
-                    );
+        if let Ok(guard) = self.conn.lock() {
+            if let Some(ref conn) = *guard {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+                if let Some(ref path) = self.file_path {
+                    debug!("Checkpointed SQLite WAL for {}", path.display());
                 }
             }
         }
     }
 
-    fn load_from_disk(path: &Path) -> std::io::Result<StatsFile> {
-        if !path.exists() {
-            return Ok(StatsFile::default());
-        }
-        let content = std::fs::read_to_string(path)?;
-        let parsed: StatsFile = serde_json::from_str(&content).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
-        Ok(parsed)
-    }
-
-    fn write_to_disk(path: &Path, stats: &StatsFile) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json_str = serde_json::to_string_pretty(stats)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-        std::fs::write(path, json_str)
-    }
-
-    /// Snapshot copy of current StatsFile for inspection/printing
+    /// Snapshot copy of current statistics from SQLite for inspection/printing
     pub fn snapshot(&self) -> StatsFile {
-        self.data.read().map(|g| g.clone()).unwrap_or_default()
+        let guard = match self.conn.lock() {
+            Ok(g) => g,
+            Err(_) => return StatsFile::default(),
+        };
+        let conn = match guard.as_ref() {
+            Some(c) => c,
+            None => return StatsFile::default(),
+        };
+
+        let updated_at: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'updated_at'", [], |r| r.get(0))
+            .unwrap_or_else(|_| chrono::Local::now().to_rfc3339());
+
+        let mut stmt = match conn.prepare(
+            "SELECT node_name, hour, successes, failures, last_updated_sec, burst_count FROM node_stats"
+        ) {
+            Ok(s) => s,
+            Err(_) => return StatsFile::default(),
+        };
+
+        let mut nodes: HashMap<String, NodeStats> = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, u32>(5)?,
+            ))
+        });
+
+        if let Ok(rows) = rows {
+            for item in rows.flatten() {
+                let (node_name, hour, successes, failures, last_updated_sec, burst_count) = item;
+                let entry = nodes.entry(node_name).or_default();
+                let counts = StatCounts {
+                    successes,
+                    failures,
+                    last_updated_sec,
+                    burst_count,
+                };
+                if hour == -1 {
+                    entry.overall = counts;
+                } else if (0..24).contains(&hour) {
+                    entry.hourly[hour as usize] = counts;
+                }
+            }
+        }
+
+        StatsFile {
+            version: 1,
+            updated_at,
+            nodes,
+        }
     }
 }
 
-/// Resolves the default path for `gyro-stats.json`.
+/// Resolves the default path for `gyro.db`.
 /// Prioritizes Antigravity CLI's configuration directory:
 /// 1. `AGY_GYRO_STATS_FILE` env var if set.
-/// 2. `%USERPROFILE%\.gemini\antigravity-cli\gyro-stats.json` (Windows)
-///    or `~/.gemini/antigravity-cli/gyro-stats.json` (Unix).
-/// 3. Fallback: `~/.agy-gyro/gyro-stats.json`.
+/// 2. `%USERPROFILE%\.gemini\antigravity-cli\gyro.db` (Windows)
+///    or `~/.gemini/antigravity-cli/gyro.db` (Unix).
+/// 3. Fallback: `~/.agy-gyro/gyro.db`.
 pub fn resolve_default_stats_path() -> PathBuf {
     if let Ok(env_path) = std::env::var("AGY_GYRO_STATS_FILE") {
         if !env_path.trim().is_empty() {
@@ -541,19 +785,19 @@ pub fn resolve_default_stats_path() -> PathBuf {
         // Preferred location: inside agy's configuration folder
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         if agy_dir.is_dir() {
-            return agy_dir.join("gyro-stats.json");
+            return agy_dir.join("gyro.db");
         }
         // If agy directory doesn't exist yet, we still prefer putting it there if ~/.gemini exists
         let gemini_dir = home.join(".gemini");
         if gemini_dir.is_dir() {
-            return agy_dir.join("gyro-stats.json");
+            return agy_dir.join("gyro.db");
         }
 
         // Fallback to agy folder path directly so it will be created there
-        return agy_dir.join("gyro-stats.json");
+        return agy_dir.join("gyro.db");
     }
 
-    std::env::temp_dir().join("gyro-stats.json")
+    std::env::temp_dir().join("gyro.db")
 }
 
 #[cfg(test)]
@@ -717,6 +961,34 @@ mod tests {
         assert!(node_stats.overall.failures > 0.0);
         assert!(node_stats.hourly[10].successes > 0.0);
         assert!(node_stats.hourly[10].failures > 0.0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_legacy_json_migration() {
+        let temp_dir = std::env::temp_dir().join(format!("gyro-migration-test-{}", rand::random::<u32>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let json_path = temp_dir.join("gyro-stats.json");
+        let mut legacy_stats = StatsFile::default();
+        let mut ns = NodeStats::default();
+        ns.overall.successes = 10.0;
+        ns.overall.failures = 2.0;
+        ns.hourly[14].successes = 5.0;
+        legacy_stats.nodes.insert("migrated-node".to_string(), ns);
+
+        let json_data = serde_json::to_string_pretty(&legacy_stats).unwrap();
+        std::fs::write(&json_path, json_data).unwrap();
+
+        let db_path = temp_dir.join("gyro.db");
+        let manager = StatsManager::new(Some(db_path), true, 20.0, 7.0 * 86400.0, 15);
+
+        let snap = manager.snapshot();
+        let node = snap.nodes.get("migrated-node").expect("migrated-node should exist in SQLite");
+        assert_eq!(node.overall.successes, 10.0);
+        assert_eq!(node.overall.failures, 2.0);
+        assert_eq!(node.hourly[14].successes, 5.0);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

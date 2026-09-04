@@ -57,7 +57,7 @@ Rather than naive sequential round-robin, `agy-gyro` features a **scientific 24-
 - **Burst Damping**: Consecutive requests within a short time window (e.g., 15s) receive diminishing statistical weight ($\Delta S = \frac{1}{1 + 0.5 \times burst}$) to prevent a quick succession of requests from artificially inflating or deflating a node's reputation.
 - **Bayesian Shrinkage Scoring**: Uses Empirical Bayes shrinkage towards both the overall node average and a neutral 50% prior ($\alpha=1.0, \beta=1.0$), ensuring that a single failure never destroys a node's standing.
 - **Effective Sample Capacity Cap**: Clamps historical sample weight (default 20.0) so nodes can rapidly recover or adapt when conditions change.
-- **Safe Persistence**: Automatically stored in the Antigravity directory (`~/.gemini/antigravity-cli/gyro-stats.json` or `%USERPROFILE%\.gemini\antigravity-cli\gyro-stats.json` on Windows).
+- **Multi-Process SQLite Persistence**: Automatically stored in SQLite database (`~/.gemini/antigravity-cli/gyro.db` or `%USERPROFILE%\.gemini\antigravity-cli\gyro.db` on Windows) with WAL mode, ensuring zero data loss, real-time transaction durability, and multi-process concurrency across multiple terminals. Legacy `gyro-stats.json` files are automatically migrated.
 
 ## Installation
 
@@ -118,7 +118,7 @@ Example output:
 ```text
 ==========================================================================
  agy-gyro Node Reliability Priority Statistics
- Stats file: C:\Users\user\.gemini\antigravity-cli\gyro-stats.json
+ Stats file: C:\Users\user\.gemini\antigravity-cli\gyro.db
  Settings: half-life=7.0 days, sample-cap=20.0, burst-window=15s
  Last updated: 2026-09-04 21:00:00 UTC
  Total tracked nodes: 3
@@ -141,7 +141,7 @@ Rank | Node Name                    | Score    | Hourly (S/F)     | Overall (S/F
 | `-u`, `--upstream`             | `AGY_GYRO_UPSTREAM_URL`             | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                         |
 | `--cloudcode-upstream`         | `AGY_GYRO_CLOUDCODE_URL`            | `https://daily-cloudcode-pa.googleapis.com` | Target upstream Cloud Code API base URL (OAuth mode)        |
 | `--agy-path`                   | `AGY_GYRO_AGY_PATH`                 | `agy`                                       | Executable path for Antigravity CLI                         |
-| `--log-file`                   | `AGY_GYRO_LOG_FILE`                 | _None_                                      | Path to log file for proxy tracing logs in wrapper mode     |
+| `--log-file`                   | `AGY_GYRO_LOG_FILE`                 | _None_                                      | Path to log file for proxy tracing logs (automatically truncated if sole active instance) |
 | `--max-retries`                | `AGY_GYRO_MAX_RETRIES`              | `10000`                                     | Maximum retry attempts for retriable errors                 |
 | `--initial-delay-ms`           | `AGY_GYRO_INITIAL_DELAY_MS`         | `200`                                       | Initial retry backoff delay in milliseconds                 |
 | `--max-delay-ms`               | `AGY_GYRO_MAX_DELAY_MS`             | `3000`                                      | Maximum backoff delay cap in milliseconds                   |
@@ -155,7 +155,7 @@ Rank | Node Name                    | Score    | Hourly (S/F)     | Overall (S/F
 | `--clash-parent`               | `AGY_GYRO_CLASH_PARENT`             | `GLOBAL`                                    | Clash parent selector group (e.g. `GLOBAL`)                 |
 | `--no-clash-switch`            | `AGY_GYRO_NO_CLASH_SWITCH`          | `false`                                     | Disable automatic Clash node switching on failure           |
 | `--retry-all`                  | `AGY_GYRO_RETRY_ALL`                | `false`                                     | Retry on all non-2xx responses (including 400/401/403)     |
-| `--stats-file`                 | `AGY_GYRO_STATS_FILE`               | `~/.gemini/antigravity-cli/gyro-stats.json` | Path to persistent node reliability stats JSON file         |
+| `--stats-file`                 | `AGY_GYRO_STATS_FILE`               | `~/.gemini/antigravity-cli/gyro.db`         | Path to persistent node reliability stats SQLite DB file    |
 | `--no-stats`                   | `AGY_GYRO_NO_STATS`                 | `false`                                     | Disable node statistics collection and priority switching   |
 | `--stats-max-samples`          | `AGY_GYRO_STATS_MAX_SAMPLES`        | `20.0`                                      | Maximum effective sample capacity cap per hourly bucket     |
 | `--stats-half-life-days`       | `AGY_GYRO_STATS_HALF_LIFE_DAYS`     | `7.0`                                       | Half-life decay in days for historical data                 |
