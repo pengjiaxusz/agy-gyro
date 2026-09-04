@@ -128,6 +128,10 @@ pub struct Config {
     /// Disable Clash auto-switch on retry
     #[arg(long, env = "AGY_GYRO_NO_CLASH_SWITCH", default_value_t = false)]
     pub no_clash_switch: bool,
+
+    /// Retry on all non-2xx responses (including 400/401/403) with Clash switch. By default only 429/5xx/408 and location-block 400 are retried.
+    #[arg(long, env = "AGY_GYRO_RETRY_ALL", default_value_t = false)]
+    pub retry_all: bool,
 }
 
 impl Config {
