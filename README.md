@@ -151,8 +151,8 @@ Rank | Node Name                    | Score    | Hourly (S/F)     | Overall (S/F
 | `--redirect-model`             | `AGY_GYRO_REDIRECT_MODEL`           | _None_                                      | Redirect model requests in `FROM:TO` format                 |
 | `--clash-api`                  | `AGY_GYRO_CLASH_API`                | `http://127.0.0.1:9097`                     | Clash external-controller base URL                          |
 | `--clash-secret`               | `AGY_GYRO_CLASH_SECRET`             | `set-your-secret`                           | Clash external-controller secret token                      |
-| `--clash-group`                | `AGY_GYRO_CLASH_GROUP`              | `PROXY`                                     | Clash proxy selector group to rotate nodes within           |
-| `--clash-parent`               | `AGY_GYRO_CLASH_PARENT`             | `GLOBAL`                                    | Clash parent selector group (e.g. `GLOBAL`)                 |
+| `--clash-group`                | `AGY_GYRO_CLASH_GROUP`              | `Proxy`                                     | Clash proxy selector group to rotate nodes within (auto-resolves case & selectors) |
+| `--clash-parent`               | `AGY_GYRO_CLASH_PARENT`             | _None_ (disabled)                           | Optional Clash parent selector to ensure it points to clash_group |
 | `--no-clash-switch`            | `AGY_GYRO_NO_CLASH_SWITCH`          | `false`                                     | Disable automatic Clash node switching on failure           |
 | `--clash-switch-cooldown-secs` | `AGY_GYRO_CLASH_SWITCH_COOLDOWN_SECS`| `5.0`                                      | Cooldown window in seconds between Clash switches           |
 | `--node-quarantine-hours`      | `AGY_GYRO_QUARANTINE_HOURS`         | `12.0`                                      | Duration in hours to quarantine nodes that return 400 location block |

@@ -2031,4 +2031,167 @@ async fn test_anchor_hysteresis_survives_transient_503() {
     let _ = std::fs::remove_dir_all(&temp_stats_dir);
 }
 
+#[tokio::test]
+async fn test_clash_switch_resolves_group_case_and_filters_subgroups() {
+    use axum::serve;
+    use tokio::net::TcpListener;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // 1. Mock Clash API with real Mihomo-style structure
+    let mock_clash = MockServer::start().await;
+
+    // Full /proxies endpoint returning Proxy with sub-groups and actual leaf nodes
+    Mock::given(method("GET"))
+        .and(path("/proxies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "proxies": {
+                "Proxy": {
+                    "type": "Selector",
+                    "now": "*C*E【备用】美国",
+                    "all": ["全部自动", "台美新日", "*B*B【主线】台湾", "*B*C【主线】日本"]
+                },
+                "全部自动": {
+                    "type": "URLTest",
+                    "now": "台美新日",
+                    "all": ["台美新日"]
+                },
+                "台美新日": {
+                    "type": "Selector",
+                    "now": "*B*B【主线】台湾",
+                    "all": ["*B*B【主线】台湾", "*B*C【主线】日本"]
+                },
+                "*B*B【主线】台湾": {
+                    "type": "Vmess"
+                },
+                "*B*C【主线】日本": {
+                    "type": "Vmess"
+                },
+                "*C*E【备用】美国": {
+                    "type": "Vmess"
+                }
+            }
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    // Direct /proxies/PROXY returns 404 (just like real case-sensitive Mihomo)
+    Mock::given(method("GET"))
+        .and(path("/proxies/PROXY"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_clash)
+        .await;
+
+    // GET /proxies/Proxy returns 200 for verification after switch
+    Mock::given(method("GET"))
+        .and(path("/proxies/Proxy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "now": "*B*B【主线】台湾",
+            "all": ["全部自动", "台美新日", "*B*B【主线】台湾", "*B*C【主线】日本"]
+        })))
+        .mount(&mock_clash)
+        .await;
+
+    // Expect PUT to /proxies/Proxy (with correctly resolved case 'Proxy', NOT 'PROXY')
+    Mock::given(method("PUT"))
+        .and(path("/proxies/Proxy"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_clash)
+        .await;
+
+    // 2. Mock upstream Gemini: first returns location-block 400, second returns 200
+    let mock_upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1internal:streamGenerateContent"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": "User location is not supported for the API use.",
+                "status": "FAILED_PRECONDITION"
+            }
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_upstream)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1internal:streamGenerateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "Location Recovered"}]}}]
+        })))
+        .mount(&mock_upstream)
+        .await;
+
+    let temp_stats_dir = std::env::temp_dir().join(format!("gyro-test-group-case-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_stats_dir);
+    let stats_path = temp_stats_dir.join("stats.json");
+
+    // Configure with uppercase PROXY and empty parent
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: Some(0),
+        upstream: mock_upstream.uri(),
+        cloudcode_upstream: mock_upstream.uri(),
+        max_retries: 5,
+        initial_delay_ms: 10,
+        max_delay_ms: 50,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        redirect_model: Vec::new(),
+        clash_api: mock_clash.uri(),
+        clash_secret: "set-your-secret".to_string(),
+        clash_group: "PROXY".to_string(), // configured with uppercase PROXY
+        clash_parent: "".to_string(),     // parent is disabled/empty
+        no_clash_switch: false,
+        retry_all: false,
+        stats_file: Some(stats_path.clone()),
+        no_stats: false,
+        stats_max_samples: 20.0,
+        stats_half_life_days: 7.0,
+        stats_burst_window_secs: 15,
+        clash_switch_cooldown_secs: 0.0,
+        no_preflight_probe: true, // test direct switch
+        ..Config::default()
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .unwrap();
+    let state = Arc::new(ProxyState::new(config, client));
+
+    let app = create_router(Arc::clone(&state));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        serve(listener, app).await.unwrap();
+    });
+
+    let http_client = Client::new();
+    let resp = http_client
+        .post(format!(
+            "http://{}/v1internal:streamGenerateContent?alt=sse",
+            bound_addr
+        ))
+        .body("request data")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Location Recovered"));
+
+    // Verify that active node is now one of the leaf nodes, NOT a sub-group
+    let active = state.get_or_fetch_active_node().await;
+    assert!(active == "*B*B【主线】台湾" || active == "*B*C【主线】日本");
+    assert_ne!(active, "台美新日");
+    assert_ne!(active, "全部自动");
+
+    let _ = std::fs::remove_dir_all(&temp_stats_dir);
+}
+
 

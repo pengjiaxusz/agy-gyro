@@ -28,6 +28,7 @@ pub struct ProxyState {
     pub cloudcode_base: String,
     pub stats_manager: Arc<StatsManager>,
     pub active_clash_node: Arc<tokio::sync::RwLock<(Option<String>, std::time::Instant)>>,
+    pub resolved_clash_group: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
 impl ProxyState {
@@ -39,6 +40,7 @@ impl ProxyState {
             .to_string();
         let stats_manager = StatsManager::from_config(&config);
         let active_clash_node = Arc::new(tokio::sync::RwLock::new((None, std::time::Instant::now())));
+        let resolved_clash_group = Arc::new(tokio::sync::RwLock::new(None));
 
         Self {
             config,
@@ -47,6 +49,7 @@ impl ProxyState {
             cloudcode_base,
             stats_manager,
             active_clash_node,
+            resolved_clash_group,
         }
     }
 
@@ -93,7 +96,11 @@ impl ProxyState {
         }
         let api = self.config.clash_api.trim_end_matches('/');
         let secret = &self.config.clash_secret;
-        let group = &self.config.clash_group;
+        let auth = if secret.is_empty() {
+            None
+        } else {
+            Some(format!("Bearer {}", secret))
+        };
         let client = match reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))
@@ -102,16 +109,13 @@ impl ProxyState {
             Ok(c) => c,
             Err(_) => return String::new(),
         };
-        let mut req = client.get(format!("{}/proxies/{}", api, group));
-        if !secret.is_empty() {
-            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", secret));
-        }
-        if let Ok(resp) = req.send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(now) = json.get("now").and_then(|v| v.as_str()) {
-                    return now.to_string();
-                }
+        let cached = self.resolved_clash_group.read().await.clone();
+        if let Ok(info) = fetch_clash_group_info(&client, api, auth.as_deref(), &self.config.clash_group, cached).await {
+            if !info.real_group.is_empty() {
+                let mut guard = self.resolved_clash_group.write().await;
+                *guard = Some(info.real_group.clone());
             }
+            return info.now;
         }
         String::new()
     }
@@ -171,6 +175,189 @@ async fn probe_candidate_node(
     }
 }
 
+/// URL-encodes a path component safely (e.g. for Chinese or special characters in proxy group names).
+pub fn encode_uri_component(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len() * 3);
+    for byte in input.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    encoded
+}
+
+#[derive(Debug, Clone)]
+pub struct ClashGroupInfo {
+    pub real_group: String,
+    pub now: String,
+    pub candidates: Vec<String>,
+}
+
+/// Helper to query Clash proxy group info, auto-resolving case differences (e.g. PROXY -> Proxy)
+/// and filtering out sub-groups (Selector/URLTest/etc.) so only real leaf nodes remain.
+pub async fn fetch_clash_group_info(
+    client: &reqwest::Client,
+    api: &str,
+    auth: Option<&str>,
+    preferred_group: &str,
+    cached_group: Option<String>,
+) -> Result<ClashGroupInfo, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = auth {
+        if let Ok(val) = token.parse::<HeaderValue>() {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+    }
+
+    // 1. Try full /proxies listing first to discover exact group names, types, and leaf nodes
+    let all_proxies_url = format!("{}/proxies", api);
+    if let Ok(resp) = client.get(&all_proxies_url).headers(headers.clone()).send().await {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(proxies_map) = json.get("proxies").and_then(|v| v.as_object()) {
+                    // Identify all non-leaf groups (Selector, URLTest, Fallback, etc.)
+                    let mut non_leaf_groups = std::collections::HashSet::new();
+                    for (k, v) in proxies_map {
+                        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if matches!(
+                            ty,
+                            "Selector" | "URLTest" | "Fallback" | "LoadBalance" | "Direct" | "Reject" | "Compatible"
+                        ) {
+                            non_leaf_groups.insert(k.clone());
+                        }
+                    }
+
+                    // Find target group name:
+                    // 1) Cached group name (if still present)
+                    // 2) Exact match
+                    // 3) Case-insensitive match (e.g. "PROXY" == "Proxy")
+                    // 4) Fallback to selector with most valid candidates
+                    let target_key = cached_group
+                        .as_deref()
+                        .filter(|c| proxies_map.contains_key(*c))
+                        .map(|c| c.to_string())
+                        .or_else(|| {
+                            if proxies_map.contains_key(preferred_group) {
+                                Some(preferred_group.to_string())
+                            } else {
+                                proxies_map
+                                    .keys()
+                                    .find(|k| k.eq_ignore_ascii_case(preferred_group))
+                                    .cloned()
+                            }
+                        })
+                        .or_else(|| {
+                            // If preferred is "Proxy" or "PROXY", look for any selector group containing candidate nodes
+                            if preferred_group.eq_ignore_ascii_case("proxy") {
+                                proxies_map
+                                    .iter()
+                                    .filter(|(_, v)| {
+                                        v.get("type").and_then(|t| t.as_str()) == Some("Selector")
+                                    })
+                                    .max_by_key(|(_, v)| {
+                                        v.get("all")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|x| x.as_str())
+                                                    .filter(|s| crate::stats::is_valid_candidate_node(s))
+                                                    .count()
+                                            })
+                                            .unwrap_or(0)
+                                    })
+                                    .map(|(k, _)| k.clone())
+                            } else {
+                                None
+                            }
+                        });
+
+                    if let Some(real_name) = target_key {
+                        if let Some(group_obj) = proxies_map.get(&real_name) {
+                            let now = group_obj
+                                .get("now")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let all = group_obj
+                                .get("all")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+
+                            let candidates: Vec<String> = all
+                                .iter()
+                                .filter_map(|v| v.as_str())
+                                .filter(|s| !non_leaf_groups.contains(*s)) // Exclude sub-groups like "台美新日", "全部自动"
+                                .filter(|s| crate::stats::is_valid_candidate_node(s))
+                                .map(|s| s.to_string())
+                                .collect();
+
+                            return Ok(ClashGroupInfo {
+                                real_group: real_name,
+                                now,
+                                candidates,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: Query single group directly (e.g. for wiremock tests where only /proxies/GROUP is mocked)
+    let group_to_query = cached_group.as_deref().unwrap_or(preferred_group);
+    let single_url = format!("{}/proxies/{}", api, encode_uri_component(group_to_query));
+    let group_resp = client
+        .get(&single_url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| format!("Clash get group error: {} (group={}, api={})", e, group_to_query, api))?;
+
+    if !group_resp.status().is_success() {
+        return Err(format!(
+            "Clash get group failed: {} (group={}, api={})",
+            group_resp.status(),
+            group_to_query,
+            api
+        ));
+    }
+
+    let group_json = group_resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Clash get group json parse failed: {} (api={})", e, api))?;
+
+    let now = group_json
+        .get("now")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let all = group_json
+        .get("all")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let candidates: Vec<String> = all
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| crate::stats::is_valid_candidate_node(s))
+        .map(|s| s.to_string())
+        .collect();
+
+    Ok(ClashGroupInfo {
+        real_group: group_to_query.to_string(),
+        now,
+        candidates,
+    })
+}
+
 async fn trigger_clash_priority_switch(
     state: &Arc<ProxyState>,
     failing_node: &str,
@@ -199,7 +386,7 @@ async fn trigger_clash_priority_switch(
 
     let api = state.config.clash_api.trim_end_matches('/');
     let secret = state.config.clash_secret.clone();
-    let group = state.config.clash_group.clone();
+    let configured_group = state.config.clash_group.clone();
     let parent = state.config.clash_parent.clone();
     // Use a fresh client without proxy to talk to local Clash API
     let client = match reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build() {
@@ -214,28 +401,69 @@ async fn trigger_clash_priority_switch(
     } else {
         Some(format!("Bearer {}", secret))
     };
-    // 1. Ensure parent points to group
-    if !parent.is_empty() && !parent.eq_ignore_ascii_case(&group) {
-        let parent_url = format!("{}/proxies/{}", api, parent);
-        let mut headers = reqwest::header::HeaderMap::new();
+
+    let cached_group = state.resolved_clash_group.read().await.clone();
+    let group_info = match fetch_clash_group_info(&client, api, auth.as_deref(), &configured_group, cached_group).await {
+        Ok(info) => {
+            if info.real_group != configured_group {
+                info!(
+                    "Clash proxy group resolved: [{}] (configured: [{}])",
+                    info.real_group, configured_group
+                );
+            }
+            let mut guard = state.resolved_clash_group.write().await;
+            *guard = Some(info.real_group.clone());
+            info
+        }
+        Err(err) => {
+            error!("{}", err);
+            return None;
+        }
+    };
+
+    let group = &group_info.real_group;
+    let now = group_info.now;
+    let all_str = group_info.candidates;
+
+    // 1. Ensure parent points to group (only if clash_parent is configured)
+    if !parent.is_empty() && !parent.eq_ignore_ascii_case(group) {
+        let parent_url = format!("{}/proxies/{}", api, encode_uri_component(&parent));
+        let mut parent_headers = reqwest::header::HeaderMap::new();
         if let Some(token) = &auth {
             if let Ok(val) = token.parse::<HeaderValue>() {
-                headers.insert(reqwest::header::AUTHORIZATION, val);
+                parent_headers.insert(reqwest::header::AUTHORIZATION, val);
             }
         }
-        // Best-effort: switch parent with verification
-        if let Ok(resp) = client.get(&parent_url).headers(headers.clone()).send().await {
+        // Best-effort: check if parent exists and contains real_group
+        if let Ok(resp) = client.get(&parent_url).headers(parent_headers.clone()).send().await {
             if resp.status().is_success() {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    let now = json.get("now").and_then(|v| v.as_str()).unwrap_or("");
-                    if now != group {
-                        let _ = client
+                    let p_now = json.get("now").and_then(|v| v.as_str()).unwrap_or("");
+                    let all = json.get("all").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let contains_group = all.iter().any(|v| {
+                        v.as_str().map(|s| s.eq_ignore_ascii_case(group)).unwrap_or(false)
+                    });
+
+                    if contains_group && !p_now.eq_ignore_ascii_case(group) {
+                        let put_res = client
                             .put(&parent_url)
-                            .headers(headers.clone())
+                            .headers(parent_headers.clone())
                             .json(&serde_json::json!({"name": group}))
                             .send()
                             .await;
-                        info!("Clash switch: {}: {} -> {}", parent, now, group);
+                        match put_res {
+                            Ok(r) if r.status().is_success() => {
+                                info!("Clash switch parent: {}: {} -> {}", parent, p_now, group);
+                            }
+                            Ok(r) => {
+                                warn!("Clash switch parent {} to {} failed: {}", parent, group, r.status());
+                            }
+                            Err(e) => {
+                                warn!("Clash switch parent {} to {} error: {}", parent, group, e);
+                            }
+                        }
+                    } else if !contains_group {
+                        debug!("Clash parent [{}] does not contain group [{}], skipping parent switch", parent, group);
                     } else {
                         debug!("Clash parent {} already at {}", parent, group);
                     }
@@ -244,46 +472,17 @@ async fn trigger_clash_priority_switch(
         }
     }
 
-    // 2. Query nodes in group
-    let group_url = format!("{}/proxies/{}", api, group);
+    if all_str.is_empty() {
+        error!("Clash switch: group {} has no valid nodes after filtering invalid/unsupported entries (api={})", group, api);
+        return None;
+    }
+
+    let group_url = format!("{}/proxies/{}", api, encode_uri_component(group));
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(token) = &auth {
         if let Ok(val) = token.parse::<HeaderValue>() {
             headers.insert(reqwest::header::AUTHORIZATION, val);
         }
-    }
-
-    let group_resp = match client.get(&group_url).headers(headers.clone()).send().await {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            error!("Clash get group failed: {} (group={}, api={})", r.status(), group, api);
-            return None;
-        }
-        Err(e) => {
-            error!("Clash get group error: {} (group={}, api={} - check Clash running?)", e, group, api);
-            return None;
-        }
-    };
-
-    let group_json = match group_resp.json::<serde_json::Value>().await {
-        Ok(j) => j,
-        Err(e) => {
-            warn!("Clash get group json parse failed: {} (api={})", e, api);
-            return None;
-        }
-    };
-
-    let all = group_json.get("all").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let now = group_json.get("now").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let all_str: Vec<String> = all
-        .iter()
-        .filter_map(|v| v.as_str())
-        .filter(|s| crate::stats::is_valid_candidate_node(s))
-        .map(|s| s.to_string())
-        .collect();
-    if all_str.is_empty() {
-        error!("Clash switch: group {} has no valid nodes after filtering invalid/unsupported entries (api={})", group, api);
-        return None;
     }
 
     let now_sec = StatsManager::now_sec();

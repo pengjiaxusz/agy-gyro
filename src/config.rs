@@ -141,12 +141,12 @@ pub struct Config {
     #[arg(long, env = "AGY_GYRO_CLASH_SECRET", default_value = "set-your-secret")]
     pub clash_secret: String,
 
-    /// Clash proxy group to rotate inside (e.g. PROXY)
-    #[arg(long, env = "AGY_GYRO_CLASH_GROUP", default_value = "PROXY")]
+    /// Clash proxy group to rotate inside (e.g. Proxy)
+    #[arg(long, env = "AGY_GYRO_CLASH_GROUP", default_value = "Proxy")]
     pub clash_group: String,
 
-    /// Clash parent selector to ensure it points to clash_group (e.g. GLOBAL)
-    #[arg(long, env = "AGY_GYRO_CLASH_PARENT", default_value = "GLOBAL")]
+    /// Clash parent selector to ensure it points to clash_group (e.g. GLOBAL, optional, empty by default)
+    #[arg(long, env = "AGY_GYRO_CLASH_PARENT", default_value = "")]
     pub clash_parent: String,
 
     /// Comma-separated two-tier region priority list (e.g. "美国,日本,台湾,新加坡")
@@ -290,8 +290,8 @@ impl Default for Config {
             redirect_model: Vec::new(),
             clash_api: "http://127.0.0.1:9097".to_string(),
             clash_secret: "set-your-secret".to_string(),
-            clash_group: "PROXY".to_string(),
-            clash_parent: "GLOBAL".to_string(),
+            clash_group: "Proxy".to_string(),
+            clash_parent: "".to_string(),
             region_priority: vec![
                 "美国".to_string(),
                 "日本".to_string(),
